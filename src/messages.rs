@@ -10,7 +10,7 @@
 
 use personai_core::macos::{AppleError, AppleTransport, run_jxa_json};
 use personai_core::safety::{GateOutcome, SoftGate};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::util::js_str;
 use crate::{DEFAULT_LIMIT, MAX_LIMIT};
@@ -99,10 +99,6 @@ fn sql_str(s: &str) -> String {
     // SQL string literal with single quotes doubled.
     format!("'{}'", s.replace('\'', "''"))
 }
-
-/// Reads chat.db via sqlite3 inside the JXA shell. The macOS epoch offset
-/// (978307200) converts Core Data timestamps; NULL texts (attachments)
-/// become empty strings.
 
 /// Builds the two full `sqlite3` shell commands in Rust (count + page), so
 /// the JXA layer receives opaque ready-made commands instead of assembling
