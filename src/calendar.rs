@@ -8,7 +8,7 @@
 
 use personai_core::macos::{AppleError, AppleTransport, run_jxa_json};
 use personai_core::safety::{GateOutcome, SoftGate};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::util::js_str;
 use crate::{DEFAULT_LIMIT, MAX_LIMIT};
@@ -63,7 +63,7 @@ impl<T: AppleTransport> CalendarToolset<T> {
         Ok(v.to_string())
     }
 
-    /// Creates an event on a calendar (default: first). Soft-gated.
+    /// Creates an event on the first calendar. Soft-gated.
     pub async fn create(
         &mut self,
         title: &str,
@@ -78,15 +78,14 @@ impl<T: AppleTransport> CalendarToolset<T> {
                 let v = run_jxa_json(&mut self.transport, &create_expr(title, start, end)).await?;
                 Ok(json!({
                     "status": "created",
-                    "id": v.get("id").cloned().unwrap_or(json!(null)),
+                    "id": v.get("id").cloned().unwrap_or(Value::Null),
                 })
                 .to_string())
             }
         }
     }
 
-    /// Updates an event found by uid. Only provided fields change; passing
-    /// no fields still re-confirms (the payload shows what is touched).
+    /// Updates an event found by uid. Only provided fields change.
     /// Soft-gated.
     pub async fn update(
         &mut self,
@@ -114,7 +113,7 @@ impl<T: AppleTransport> CalendarToolset<T> {
     async fn check(
         &mut self,
         action: &'static str,
-        payload: &serde_json::Value,
+        payload: &Value,
         token: Option<&str>,
     ) -> Result<GateOutcome, AppleError> {
         match self.gate.as_mut() {
@@ -129,7 +128,7 @@ impl<T: AppleTransport> CalendarToolset<T> {
     }
 }
 
-fn confirm_response(payload: serde_json::Value, token: String) -> String {
+fn confirm_response(payload: Value, token: String) -> String {
     json!({
         "status": "requires_confirmation",
         "payload": payload,
@@ -141,6 +140,10 @@ fn confirm_response(payload: serde_json::Value, token: String) -> String {
 
 // --- JXA expression builders -------------------------------------------------
 
+/// Pass 1 fetches one bulk `startDate()` array per calendar and filters in
+/// JS; pass 2 hydrates only the requested page. A `whose()` specifier
+/// re-evaluates its query on every element access, which times out once
+/// several calendars are involved.
 fn read_expr(start: Option<String>, end: Option<String>, limit: u32, offset: u32) -> String {
     let start_ms = start
         .map(|s| format!("Date.parse({})", js_str(&s)))
@@ -153,31 +156,33 @@ fn read_expr(start: Option<String>, end: Option<String>, limit: u32, offset: u32
   const C = Application('Calendar');
   const startMs = {start_ms};
   const endMs = {end_ms};
-  const out = [];
-  let total = 0;
+  let matches = [];
   for (const cal of C.calendars()) {{
-    const evs = cal.events.whose({{_and: [
-      {{startDate: {{_greaterThan: new Date(startMs)}}}},
-      {{startDate: {{_lessThan: new Date(endMs)}}}},
-    ]}});
-    const n = evs.length;
-    total += n;
-    const pageStart = Math.max(0, {offset} - out.length);
-    if (out.length < {limit} && pageStart < n) {{
-      const pageEnd = Math.min(n, pageStart + ({limit} - out.length));
-      for (let i = pageStart; i < pageEnd; i++) {{
-        const e = evs[i];
-        try {{
-          out.push({{
-            id: String(e.uid()),
-            title: e.summary(),
-            start: e.startDate().toISOString(),
-            end: e.endDate().toISOString(),
-            calendar: cal.name(),
-          }});
-        }} catch (err) {{}}
+    const n = cal.events.length;
+    if (n === 0) continue;
+    const starts = cal.events.startDate();
+    for (let i = 0; i < starts.length; i++) {{
+      const t = starts[i] ? starts[i].getTime() : NaN;
+      if ((startMs === null || t >= startMs) && (endMs === null || t < endMs)) {{
+        matches.push([cal, i]);
       }}
     }}
+  }}
+  const total = matches.length;
+  const out = [];
+  const end = Math.min({offset} + {limit}, total);
+  for (let k = {offset}; k < end; k++) {{
+    const [cal, i] = matches[k];
+    try {{
+      const e = cal.events[i];
+      out.push({{
+        id: String(e.uid()),
+        title: e.summary(),
+        start: e.startDate().toISOString(),
+        end: e.endDate().toISOString(),
+        calendar: cal.name(),
+      }});
+    }} catch (err) {{}}
   }}
   return {{total: total, offset: {offset}, limit: {limit}, events: out}};
 }})()"#
