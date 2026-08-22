@@ -1,0 +1,78 @@
+{
+  "project": "mcp-macos",
+  "updated": "2026-08-22",
+  "features": [
+    {
+      "id": "scaffold",
+      "name": "Server scaffold: rmcp 3.1.4, stdio, contract test",
+      "status": "done",
+      "evidence": "commit 3147336; tests/server.rs handshake round trip"
+    },
+    {
+      "id": "mail",
+      "name": "Mail tools (list/search/read/send, soft-gated send)",
+      "status": "done",
+      "evidence": "commit 3cafc51; 7 mock tests + real Mail test vs 22k-message inbox"
+    },
+    {
+      "id": "messages",
+      "name": "Messages tools (chat.db reader, soft-gated send)",
+      "status": "done",
+      "evidence": "commit bb0f5d7; 5 tests incl. real chat.db read"
+    },
+    {
+      "id": "notifications",
+      "name": "Notifications tool",
+      "status": "done",
+      "evidence": "commit bb0f5d7; 3 mock contract tests"
+    },
+    {
+      "id": "calendar",
+      "name": "Calendar tools (list/read/create/update, soft-gated writes)",
+      "status": "done",
+      "evidence": "commit bda57b9; 6 tests incl. real Calendar read over 25 calendars"
+    },
+    {
+      "id": "clipboard",
+      "name": "Clipboard get/set via pbcopy/pbpaste",
+      "status": "done",
+      "evidence": "commit bda57b9; macOS roundtrip test restores prior content"
+    },
+    {
+      "id": "permissions-doctor",
+      "name": "permissions_check TCC doctor + core fix hints",
+      "status": "done",
+      "evidence": "commit c0656a0; live run reports Mail/Calendar/Messages all granted"
+    },
+    {
+      "id": "tool-annotations",
+      "name": "ToolAnnotations (read_only/destructive) on every tool",
+      "status": "done",
+      "evidence": "commit c0656a0; annotations visible in tools/list smoke output"
+    },
+    {
+      "id": "tools-config",
+      "name": "--tools / MCP_MACOS_TOOLS group trimming",
+      "status": "done",
+      "evidence": "commit c0656a0; --tools mail lists exactly mail_* + permissions_check"
+    },
+    {
+      "id": "docs",
+      "name": "README + docs/{tools,safety,development}.md + LICENSE",
+      "status": "done",
+      "evidence": "commit d4edc5d"
+    },
+    {
+      "id": "release-ci",
+      "name": "CI: linux+macos jobs, release job packaging aarch64 binary",
+      "status": "done",
+      "evidence": ".github/workflows/ci.yml; not yet executed (no GitHub remote)"
+    },
+    {
+      "id": "publish",
+      "name": "crates.io publish v0.1.0",
+      "status": "blocked",
+      "note": "requires user crates.io token; then flip personai-core path dep to published version"
+    }
+  ]
+}
