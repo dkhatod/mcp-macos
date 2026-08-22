@@ -18,10 +18,15 @@ use rmcp::tool_router;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+pub mod calendar;
+pub mod clipboard;
 pub mod mail;
 pub mod messages;
 pub mod notifications;
 pub mod util;
+
+use calendar::CalendarToolset;
+use clipboard::ClipboardToolset;
 
 use mail::MailToolset;
 use messages::MessagesToolset;
@@ -42,7 +47,9 @@ pub(crate) const MAX_LIMIT: u32 = 100;
 pub struct ServerState {
     mail: MailToolset<RealTransport>,
     messages: MessagesToolset<RealTransport>,
+    calendar: CalendarToolset<RealTransport>,
     notifications: NotificationsToolset<RealTransport>,
+    clipboard: ClipboardToolset,
 }
 
 /// The MCP server handle passed to every tool method.
@@ -69,7 +76,13 @@ impl MacosServer {
                     eprintln!("messages gate unavailable ({e}); messages_send will refuse");
                     MessagesToolset::new(RealTransport)
                 }),
+            calendar: CalendarToolset::with_gate(RealTransport, gated("tokens.calendar.json"))
+                .unwrap_or_else(|e| {
+                    eprintln!("calendar gate unavailable ({e}); writes will refuse");
+                    CalendarToolset::new(RealTransport)
+                }),
             notifications: NotificationsToolset::new(RealTransport),
+            clipboard: ClipboardToolset::new(),
         };
         Self {
             state_dir,
@@ -160,6 +173,127 @@ impl MacosServer {
                 .await,
         )
     }
+
+    // --- Calendar ------------------------------------------------------------
+
+    #[tool(description = "List calendar names on this Mac.")]
+    async fn calendar_list(&self) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(st.calendar.list().await)
+    }
+
+    #[tool(
+        description = "Read events with start date in [start, end) (ISO 8601). Returns {total, offset, limit, events:[{id, title, start, end, calendar}]}."
+    )]
+    async fn calendar_read(&self, Parameters(p): Parameters<CalendarReadParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.calendar
+                .read(Some(p.start), Some(p.end), p.limit, p.offset.unwrap_or(0))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Create a calendar event (first calendar). Soft-gated: re-invoke with confirmation_token to execute. Tokens are single-use, 5-minute TTL."
+    )]
+    async fn calendar_create(&self, Parameters(p): Parameters<CalendarCreateParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.calendar
+                .create(&p.title, &p.start, &p.end, p.confirmation_token.as_deref())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Update an event by id (uid from calendar_read); only provided fields change. Soft-gated."
+    )]
+    async fn calendar_update(&self, Parameters(p): Parameters<CalendarUpdateParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.calendar
+                .update(
+                    &p.id,
+                    p.title.as_deref(),
+                    p.start.as_deref(),
+                    p.end.as_deref(),
+                    p.confirmation_token.as_deref(),
+                )
+                .await,
+        )
+    }
+
+    // --- Clipboard -----------------------------------------------------------
+
+    #[tool(description = "Read UTF-8 text from the macOS clipboard.")]
+    async fn clipboard_get(&self) -> String {
+        let st = self.inner.lock().await;
+        match st.clipboard.get() {
+            Ok(text) => serde_json::json!({ "text": text }).to_string(),
+            Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+        }
+    }
+
+    #[tool(description = "Write UTF-8 text to the macOS clipboard.")]
+    async fn clipboard_set(&self, Parameters(p): Parameters<ClipboardSetParams>) -> String {
+        let st = self.inner.lock().await;
+        match st.clipboard.set(&p.text) {
+            Ok(()) => serde_json::json!({ "status": "set" }).to_string(),
+            Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CalendarReadParams {
+    /// Range start (ISO 8601), inclusive.
+    pub start: String,
+    /// Range end (ISO 8601), exclusive.
+    pub end: String,
+    /// Page size (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Page offset (default 0).
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CalendarCreateParams {
+    /// Event title.
+    pub title: String,
+    /// Start time (ISO 8601).
+    pub start: String,
+    /// End time (ISO 8601).
+    pub end: String,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CalendarUpdateParams {
+    /// Event uid from calendar_read.
+    pub id: String,
+    /// New title (optional).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// New start time (optional, ISO 8601).
+    #[serde(default)]
+    pub start: Option<String>,
+    /// New end time (optional, ISO 8601).
+    #[serde(default)]
+    pub end: Option<String>,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ClipboardSetParams {
+    /// Text to place on the clipboard.
+    pub text: String,
 }
 
 #[derive(Deserialize, JsonSchema)]

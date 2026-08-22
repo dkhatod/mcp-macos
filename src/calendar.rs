@@ -1,1 +1,224 @@
+//! macOS Calendar tools.
+//!
+//! Reads are auto-tier; create/update go through the soft gate. All scripts
+//! are JXA via `run_jxa_json`; ISO 8601 strings convert with native JS
+//! `Date` parsing (no locale-fragile AppleScript date literals).
+//!
+//! Context discipline: `read` is paginated and returns event metadata only.
 
+use personai_core::macos::{AppleError, AppleTransport, run_jxa_json};
+use personai_core::safety::{GateOutcome, SoftGate};
+use serde_json::json;
+
+use crate::util::js_str;
+use crate::{DEFAULT_LIMIT, MAX_LIMIT};
+
+/// Calendar tool group over any transport.
+pub struct CalendarToolset<T: AppleTransport> {
+    pub transport: T,
+    /// Soft gate for writes (token store under the state dir).
+    pub gate: Option<SoftGate>,
+}
+
+impl<T: AppleTransport> CalendarToolset<T> {
+    pub fn new(transport: T) -> Self {
+        Self {
+            transport,
+            gate: None,
+        }
+    }
+
+    /// Production constructor: gate backed by `token_store`.
+    pub fn with_gate(transport: T, token_store: std::path::PathBuf) -> Result<Self, AppleError> {
+        Ok(Self {
+            transport,
+            gate: Some(
+                SoftGate::new(token_store)
+                    .map_err(|e| AppleError::Transport(format!("gate unavailable: {e}")))?,
+            ),
+        })
+    }
+
+    /// Lists calendar names.
+    pub async fn list(&mut self) -> Result<String, AppleError> {
+        let v = run_jxa_json(
+            &mut self.transport,
+            "(() => { const C = Application('Calendar'); \
+             return C.calendars().map(c => c.name()); })()",
+        )
+        .await?;
+        Ok(json!({ "calendars": v }).to_string())
+    }
+
+    /// Reads events with `start <= startDate < end`, newest first.
+    pub async fn read(
+        &mut self,
+        start: Option<String>,
+        end: Option<String>,
+        limit: Option<u32>,
+        offset: u32,
+    ) -> Result<String, AppleError> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        let v = run_jxa_json(&mut self.transport, &read_expr(start, end, limit, offset)).await?;
+        Ok(v.to_string())
+    }
+
+    /// Creates an event on a calendar (default: first). Soft-gated.
+    pub async fn create(
+        &mut self,
+        title: &str,
+        start: &str,
+        end: &str,
+        token: Option<&str>,
+    ) -> Result<String, AppleError> {
+        let payload = json!({ "title": title, "start": start, "end": end });
+        match self.check("calendar.create", &payload, token).await? {
+            GateOutcome::Confirm { payload, token } => Ok(confirm_response(payload, token)),
+            GateOutcome::Execute => {
+                let v = run_jxa_json(&mut self.transport, &create_expr(title, start, end)).await?;
+                Ok(json!({
+                    "status": "created",
+                    "id": v.get("id").cloned().unwrap_or(json!(null)),
+                })
+                .to_string())
+            }
+        }
+    }
+
+    /// Updates an event found by uid. Only provided fields change; passing
+    /// no fields still re-confirms (the payload shows what is touched).
+    /// Soft-gated.
+    pub async fn update(
+        &mut self,
+        id: &str,
+        title: Option<&str>,
+        start: Option<&str>,
+        end: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<String, AppleError> {
+        let payload = json!({
+            "id": id,
+            "title": title,
+            "start": start,
+            "end": end,
+        });
+        match self.check("calendar.update", &payload, token).await? {
+            GateOutcome::Confirm { payload, token } => Ok(confirm_response(payload, token)),
+            GateOutcome::Execute => {
+                run_jxa_json(&mut self.transport, &update_expr(id, title, start, end)).await?;
+                Ok(json!({ "status": "updated", "id": id }).to_string())
+            }
+        }
+    }
+
+    async fn check(
+        &mut self,
+        action: &'static str,
+        payload: &serde_json::Value,
+        token: Option<&str>,
+    ) -> Result<GateOutcome, AppleError> {
+        match self.gate.as_mut() {
+            Some(gate) => gate
+                .check(action, payload, token)
+                .await
+                .map_err(|e| AppleError::Transport(format!("gate error: {e}"))),
+            None => Err(AppleError::Transport(String::from(
+                "soft gate not configured — refusing to modify the calendar",
+            ))),
+        }
+    }
+}
+
+fn confirm_response(payload: serde_json::Value, token: String) -> String {
+    json!({
+        "status": "requires_confirmation",
+        "payload": payload,
+        "confirmation_token": token,
+        "note": "Show this payload to the user; re-invoke with confirmation_token to execute.",
+    })
+    .to_string()
+}
+
+// --- JXA expression builders -------------------------------------------------
+
+fn read_expr(start: Option<String>, end: Option<String>, limit: u32, offset: u32) -> String {
+    let start_ms = start
+        .map(|s| format!("Date.parse({})", js_str(&s)))
+        .unwrap_or_else(|| "null".into());
+    let end_ms = end
+        .map(|s| format!("Date.parse({})", js_str(&s)))
+        .unwrap_or_else(|| "null".into());
+    format!(
+        r#"(() => {{
+  const C = Application('Calendar');
+  const startMs = {start_ms};
+  const endMs = {end_ms};
+  const out = [];
+  let total = 0;
+  for (const cal of C.calendars()) {{
+    const evs = cal.events.whose({{_and: [
+      {{startDate: {{_greaterThan: new Date(startMs)}}}},
+      {{startDate: {{_lessThan: new Date(endMs)}}}},
+    ]}});
+    const n = evs.length;
+    total += n;
+    const pageStart = Math.max(0, {offset} - out.length);
+    if (out.length < {limit} && pageStart < n) {{
+      const pageEnd = Math.min(n, pageStart + ({limit} - out.length));
+      for (let i = pageStart; i < pageEnd; i++) {{
+        const e = evs[i];
+        try {{
+          out.push({{
+            id: String(e.uid()),
+            title: e.summary(),
+            start: e.startDate().toISOString(),
+            end: e.endDate().toISOString(),
+            calendar: cal.name(),
+          }});
+        }} catch (err) {{}}
+      }}
+    }}
+  }}
+  return {{total: total, offset: {offset}, limit: {limit}, events: out}};
+}})()"#
+    )
+}
+
+fn create_expr(title: &str, start: &str, end: &str) -> String {
+    format!(
+        r#"(() => {{
+  const C = Application('Calendar');
+  const cal = C.calendars[0];
+  const ev = C.Event({{summary: {}, startDate: new Date(Date.parse({})), endDate: new Date(Date.parse({}))}}).make({{at: cal}});
+  return {{id: String(ev.uid())}};
+}})()"#,
+        js_str(title),
+        js_str(start),
+        js_str(end),
+    )
+}
+
+fn update_expr(id: &str, title: Option<&str>, start: Option<&str>, end: Option<&str>) -> String {
+    let sets = [
+        title.map(|t| format!("e.summary = {};", js_str(t))),
+        start.map(|s| format!("e.startDate = new Date(Date.parse({}));", js_str(s))),
+        end.map(|s| format!("e.endDate = new Date(Date.parse({}));", js_str(s))),
+    ];
+    let body: String = sets.into_iter().flatten().collect();
+    format!(
+        r#"(() => {{
+  const C = Application('Calendar');
+  for (const cal of C.calendars()) {{
+    const hits = cal.events.whose({{uid: {}}});
+    if (hits.length > 0) {{
+      const e = hits[0];
+      {}
+      return {{id: String(e.uid())}};
+    }}
+  }}
+  throw new Error('event not found');
+}})()"#,
+        js_str(id),
+        body,
+    )
+}
