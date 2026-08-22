@@ -54,8 +54,9 @@ $ cargo install mcp-macos        # or download a release binary
 
 | Tool | What it does | Safety tier |
 |---|---|---|
-| `mail_list_accounts` | List Mail account names | auto |
-| `mail_search` | Search message metadata (never bodies), paginated | auto |
+| `mail_list_accounts` | List accounts with identity details (email, type) | auto |
+| `mail_list_mailboxes` | List mailboxes per account with counts | auto |
+| `mail_search` | Search message metadata (never bodies) across all accounts by default; optional account/mailbox narrowing | auto |
 | `mail_read` | Read one full message by id | auto |
 | `mail_send` | Send email | soft-gated |
 | `messages_read` | Read iMessage/SMS history from chat.db | auto |

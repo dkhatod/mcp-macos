@@ -45,7 +45,7 @@ async fn search_returns_metadata_only_and_paginates() {
     let env = format!(r#"{{"ok":true,"value":{mailbox}}}"#);
     let mut f = fixture(&[&env]);
     let res =
-        f.ts.search("application", None, None, Some(2), 0)
+        f.ts.search("application", None, None, None, Some(2), 0)
             .await
             .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
@@ -63,9 +63,16 @@ async fn search_returns_metadata_only_and_paginates() {
 async fn search_escapes_user_text_into_script() {
     let mut f = fixture(&[r#"{"ok":true,"value":{"total":0,"results":[]}}"#]);
     let _ =
-        f.ts.search("O'Brien \"quoted\" \\path", Some("work"), None, None, 0)
-            .await
-            .unwrap();
+        f.ts.search(
+            "O'Brien \"quoted\" \\path",
+            Some("work"),
+            None,
+            None,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
     let script = &f.ts.transport.calls()[0].script;
     // Quotes and backslashes escaped so the text cannot break out of the
     // JS string literal; queries are matched case-insensitively, so the
@@ -170,7 +177,7 @@ async fn real_mail_accounts_search_read() {
     let v: serde_json::Value = serde_json::from_str(&accounts).unwrap();
     assert!(v["accounts"].as_array().unwrap().len() >= 1);
 
-    let res = ts.search("a", None, None, Some(5), 0).await.unwrap();
+    let res = ts.search("a", None, None, None, Some(5), 0).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     let results = v["results"].as_array().unwrap();
     assert!(v["total"].as_u64().unwrap() >= 1);
@@ -181,4 +188,43 @@ async fn real_mail_accounts_search_read() {
         let v: serde_json::Value = serde_json::from_str(&full).unwrap();
         assert!(v["body"].is_string());
     }
+}
+
+#[tokio::test]
+async fn list_accounts_returns_identity_fields() {
+    let mut f = fixture(&[
+        r#"{"ok":true,"value":[{"name":"Google","email":"d@gmail.com","accountType":"imap","enabled":true}]}"#,
+    ]);
+    let res = f.ts.list_accounts().await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert_eq!(v["accounts"][0]["name"], "Google");
+    assert_eq!(v["accounts"][0]["email"], "d@gmail.com");
+    assert_eq!(v["accounts"][0]["accountType"], "imap");
+}
+
+#[tokio::test]
+async fn list_mailboxes_returns_counts_and_respects_filter() {
+    let mut f = fixture(&[
+        r#"{"ok":true,"value":{"mailboxes":[{"account":"Google","name":"INBOX","count":120},{"account":"Google","name":"Work","count":7}]}}"#,
+    ]);
+    let res = f.ts.list_mailboxes(Some("Google".into())).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert_eq!(v["mailboxes"].as_array().unwrap().len(), 2);
+    assert_eq!(v["mailboxes"][0]["count"], 120);
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(script.contains(r#""Google""#), "{script}");
+}
+
+#[tokio::test]
+async fn search_targets_named_mailbox_when_given() {
+    let mut f = fixture(&[r#"{"ok":true,"value":{"total":0,"results":[]}}"#]);
+    let _ =
+        f.ts.search("x", Some("Google"), Some("Work".into()), None, None, 0)
+            .await
+            .unwrap();
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(
+        script.contains(r#""Work""#),
+        "mailbox not targeted: {script}"
+    );
 }

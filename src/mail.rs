@@ -41,15 +41,30 @@ impl<T: AppleTransport> MailToolset<T> {
         })
     }
 
-    /// Lists configured Mail account names.
+    /// Lists configured Mail accounts with identity fields, so agents can
+    /// reason about which account is which (display names alone are often
+    /// just "Google" / "Exchange").
     pub async fn list_accounts(&mut self) -> Result<String, AppleError> {
         let v = run_jxa_json(
             &mut self.transport,
             "(() => { const M = Application('Mail'); \
-             return M.accounts().map(a => a.name()); })()",
+             return M.accounts().map(a => ({ \
+               name: a.name(), \
+               email: (a.emailAddresses()[0] || ''), \
+               accountType: String(a.accountType()), \
+               enabled: a.enabled() \
+             })); })()",
         )
         .await?;
         Ok(json!({ "accounts": v }).to_string())
+    }
+
+    /// Lists mailboxes (per account, with message counts) so agents can
+    /// discover where mail actually lives before searching — Gmail labels
+    /// like Work/Important are separate mailboxes outside the inbox.
+    pub async fn list_mailboxes(&mut self, account: Option<String>) -> Result<String, AppleError> {
+        let v = run_jxa_json(&mut self.transport, &mailboxes_expr(account.as_deref())).await?;
+        Ok(v.to_string())
     }
 
     /// Searches Mail metadata. Returns `{total, offset, limit, results}`
@@ -59,6 +74,7 @@ impl<T: AppleTransport> MailToolset<T> {
         &mut self,
         query: &str,
         account: Option<&str>,
+        mailbox: Option<String>,
         since: Option<&str>,
         limit: Option<u32>,
         offset: u32,
@@ -66,7 +82,7 @@ impl<T: AppleTransport> MailToolset<T> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let v = run_jxa_json(
             &mut self.transport,
-            &search_expr(query, account, since, limit, offset),
+            &search_expr(query, account, mailbox.as_deref(), since, limit, offset),
         )
         .await?;
 
@@ -143,7 +159,7 @@ impl<T: AppleTransport> MailToolset<T> {
 // Each builder returns a single JS *expression* (an arrow IIFE) embedded by
 // `wrap_jxa`. User text enters only through `js_str`.
 
-/// Scans the newest [`SCAN_MAX`] messages of the target inbox with four
+/// Scans the newest [`SCAN_MAX`] messages of the target mailbox with four
 /// bulk Apple Events, filters in JS, pages the matches. Individual access
 /// through a `whose(...)` specifier re-evaluates the whole query per item
 /// and times out on real mailboxes.
@@ -152,17 +168,30 @@ const SCAN_MAX: u32 = 1000;
 fn search_expr(
     query: &str,
     account: Option<&str>,
+    mailbox: Option<&str>,
     since: Option<&str>,
     limit: u32,
     offset: u32,
 ) -> String {
     let q = js_str(&query.to_lowercase());
-    let account_clause = match account {
-        Some(name) => format!(
-            "let box = M.accounts.whose({{name: {}}})()[0].inbox();",
-            js_str(name)
+    // Default: the unified inbox (all accounts). `account` narrows to that
+    // account's inbox; `mailbox` targets a named mailbox inside `account`
+    // (Gmail labels live there, outside the inbox).
+    let account_clause = match (account, mailbox) {
+        (Some(a), Some(mb)) => format!(
+            "let box = M.accounts.whose({{name: {a}}})()[0].mailboxes.whose({{name: {mb}}})()[0];",
+            a = js_str(a),
+            mb = js_str(mb)
         ),
-        None => "let box = M.inbox();".to_string(),
+        (Some(a), None) => format!(
+            "let box = M.accounts.whose({{name: {}}})()[0].inbox();",
+            js_str(a)
+        ),
+        (None, Some(mb)) => format!(
+            "let box = M.mailboxes.whose({{name: {}}})()[0];",
+            js_str(mb)
+        ),
+        (None, None) => "let box = M.inbox();".to_string(),
     };
     // All narrowing happens in JS over one bulk metadata fetch — Mail-side
     // `whose` results cannot take bulk property gets, and per-item
@@ -205,6 +234,33 @@ fn search_expr(
     }});
   }}
   return {{total: total, results: out}};
+}})()"#
+    )
+}
+
+/// Enumerates mailboxes with message counts. Full sweep of 3 accounts /
+/// ~42 mailboxes measured at ~2 s live; `account` narrows to one account.
+fn mailboxes_expr(account: Option<&str>) -> String {
+    let account_clause = match account {
+        Some(name) => format!(
+            "const accounts = M.accounts.whose({{name: {}}})().map(a => [a.name(), a]);",
+            js_str(name)
+        ),
+        None => "const accounts = M.accounts().map(a => [a.name(), a]);".to_string(),
+    };
+    format!(
+        r#"(() => {{
+  const M = Application('Mail');
+  {account_clause}
+  const mailboxes = [];
+  for (const [acctName, a] of accounts) {{
+    for (const mb of a.mailboxes()) {{
+      let count = 0;
+      try {{ count = mb.messages.length; }} catch (e) {{}}
+      mailboxes.push({{account: acctName, name: mb.name(), count: count}});
+    }}
+  }}
+  return {{mailboxes: mailboxes}};
 }})()"#
     )
 }
@@ -252,7 +308,7 @@ mod tests {
 
     #[test]
     fn search_builder_escapes_user_text() {
-        let s = search_expr("O'Brien \"x\"", Some("work"), None, 20, 0);
+        let s = search_expr("O'Brien \"x\"", Some("work"), None, None, 20, 0);
         assert!(s.contains(r#""o'brien \"x\"""#), "{s}");
         assert!(s.contains(r#"{name: "work"}"#), "{s}");
     }

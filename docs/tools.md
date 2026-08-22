@@ -9,24 +9,50 @@ returns a confirmation payload first.
 
 ### mail_list_accounts — auto
 
-List configured Mail account names.
+List configured Mail accounts **with identity details** (display names alone
+are often just "Google"/"Exchange").
 
 ```json
-{"accounts": ["Google", "dhruvkhatodschool@gmail.com", "Exchange"]}
+{"accounts": [
+  {"name": "Google", "email": "you@gmail.com", "accountType": "imap", "enabled": true},
+  {"name": "Exchange", "email": "you@work.com", "accountType": "exchange", "enabled": true}
+]}
+```
+
+### mail_list_mailboxes — auto
+
+Enumerate mailboxes per account with message counts. Gmail labels (Work,
+Personal, Important…) are mailboxes *outside* the inbox — call this before
+`mail_search` when unsure where mail lives. ~2 s for a full sweep.
+
+| Param | Type | Notes |
+|---|---|---|
+| account | string? | narrow to one account name |
+
+```json
+{"mailboxes": [
+  {"account": "Google", "name": "INBOX", "count": 120},
+  {"account": "Google", "name": "Work", "count": 7},
+  {"account": "Google", "name": "All Mail", "count": 23551}
+]}
 ```
 
 ### mail_search — auto
 
+Returns metadata **only** — never bodies. By default searches the **unified
+inbox of ALL accounts**; `account` narrows to one account's inbox, and
+`account` + `mailbox` targets a specific mailbox (Gmail labels live there,
+not in the inbox). Scan window: newest 1000 messages (`SCAN_MAX` in
+`src/mail.rs`).
+
 | Param | Type | Notes |
 |---|---|---|
 | query | string | case-insensitive match against subject or sender |
-| account | string? | restrict to one account's inbox |
+| account | string? | restrict to one account (its inbox) |
+| mailbox | string? | target this named mailbox within `account` |
 | since | ISO 8601 string? | only messages received after this instant |
 | limit | u32? | page size, default 20, hard max 100 |
 | offset | u32? | default 0 |
-
-Returns metadata **only** — never bodies. Scan window: newest 1000 messages
-of the target inbox (`SCAN_MAX` in `src/mail.rs`).
 
 ```json
 {"total": 3, "offset": 0, "limit": 2, "results": [

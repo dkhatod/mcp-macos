@@ -178,7 +178,7 @@ impl MacosServer {
     // --- Mail ---------------------------------------------------------------
 
     #[tool(
-        description = "List Mail account names configured on this Mac.",
+        description = "List Mail accounts with identity details (name, email address, type, enabled). Display names alone are often just 'Google'/'Exchange' — use the email field to tell accounts apart. Runs across ALL configured accounts.",
         annotations(read_only_hint = true)
     )]
     async fn mail_list_accounts(&self) -> String {
@@ -190,7 +190,19 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Search Mail. Returns metadata only (id, subject, from, date, snippet), paginated as {total, offset, limit, results}. Use mail_read for full content.",
+        description = "List Mail mailboxes per account with message counts (Gmail labels like Work/Personal/Important are separate mailboxes outside the inbox). Call this before mail_search when unsure where mail lives. Optionally narrow to one account by name.",
+        annotations(read_only_hint = true)
+    )]
+    async fn mail_list_mailboxes(&self, Parameters(p): Parameters<MailMailboxesParams>) -> String {
+        if !self.enabled.mail {
+            return Self::disabled("mail");
+        }
+        let mut st = self.inner.lock().await;
+        json_result(st.mail.list_mailboxes(p.account).await)
+    }
+
+    #[tool(
+        description = "Search Mail metadata (id, subject, from, date, snippet — never bodies), paginated as {total, offset, limit, results}. By default searches the unified inbox of ALL accounts; pass account to narrow to one account's inbox, or account+mailbox for a specific mailbox (use mail_list_mailboxes to discover them). Use mail_read for full content.",
         annotations(read_only_hint = true)
     )]
     async fn mail_search(&self, Parameters(p): Parameters<MailSearchParams>) -> String {
@@ -203,6 +215,7 @@ impl MacosServer {
                 .search(
                     &p.query,
                     p.account.as_deref(),
+                    p.mailbox.clone(),
                     p.since.as_deref(),
                     p.limit,
                     p.offset.unwrap_or(0),
@@ -436,14 +449,17 @@ impl rmcp::ServerHandler for MacosServer {
         })
     }
 }
-
 #[derive(Deserialize, JsonSchema)]
 pub struct MailSearchParams {
     /// Case-insensitive text matched against subject or sender.
     pub query: String,
-    /// Optional Mail account name to search within.
+    /// Optional Mail account name; narrows to that account's inbox.
     #[serde(default)]
     pub account: Option<String>,
+    /// Optional mailbox name inside `account` (Gmail labels live here, not
+    /// in the inbox). Discover via mail_list_mailboxes.
+    #[serde(default)]
+    pub mailbox: Option<String>,
     /// Optional ISO 8601 date; only messages received after this instant.
     #[serde(default)]
     pub since: Option<String>,
@@ -453,6 +469,13 @@ pub struct MailSearchParams {
     /// Page offset (default 0).
     #[serde(default)]
     pub offset: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MailMailboxesParams {
+    /// Optional account name to narrow the listing.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
