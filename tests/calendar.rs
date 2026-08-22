@@ -121,11 +121,22 @@ mod real {
     use super::*;
     use personai_core::macos::JxaTransport;
 
-    /// Real Calendar round trip — strictly read-only.
+    /// Real Calendar round trip — strictly read-only. Skips on CI runners
+    /// where the TCC consent prompt cannot be approved (timeout/permission).
     #[tokio::test]
     async fn real_calendar_list_and_read() {
         let mut ts = CalendarToolset::new(JxaTransport);
-        let lists = ts.list().await.unwrap_or_else(|e| panic!("list: {e}"));
+        let lists = match ts.list().await {
+            Ok(l) => l,
+            Err(e)
+                if e.to_string().contains("permission denied")
+                    || e.to_string().contains("timed out") =>
+            {
+                eprintln!("skipping: no Calendar automation grant on this host ({e})");
+                return;
+            }
+            Err(e) => panic!("list: {e}"),
+        };
         assert!(lists.contains("calendars"));
         let res = ts
             .read(
