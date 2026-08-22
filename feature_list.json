@@ -63,16 +63,10 @@
       "evidence": "commit d4edc5d"
     },
     {
-      "id": "release-ci",
-      "name": "CI: linux+macos jobs, release job packaging aarch64 binary",
-      "status": "done",
-      "evidence": ".github/workflows/ci.yml; not yet executed (no GitHub remote)"
-    },
-    {
       "id": "publish",
       "name": "crates.io publish v0.1.0",
-      "status": "blocked",
-      "note": "requires user crates.io token; then flip personai-core path dep to published version"
+      "status": "done",
+      "evidence": "personai-core 0.1.0 and mcp-macos 0.1.0 live on crates.io; path dep flipped to version; tags v0.1.0 (local, push pending remote)"
     }
   ]
 }

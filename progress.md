@@ -26,12 +26,16 @@ committed locally (no GitHub remote yet).
   (`tokens.<group>.json`) under the state dir.
 
 **Blocked / next:**
-1. `cargo publish` personai-core, then mcp-macos (needs user crates.io
-   token; flip `personai-core` from path dep to version after).
-2. Create GitHub remotes and push (CI + release job unexecuted).
+1. DONE 2026-08-22: published — `personai-core 0.1.0` and `mcp-macos 0.1.0`
+   live on crates.io; path dep flipped to `"0.1"`; tags v0.1.0 (push when
+   remote exists).
+2. Create GitHub remotes and push (CI + release job unexecuted; tags push
+   triggers first binary release).
 3. E2E release gate in OMP (spec §9.4): "check my email for job
    application updates" and "send this summary to Mom" (soft gate →
    confirm). Real sends were deliberately never exercised during this run.
+4. Docs deep-dive in progress: architecture.md + reference-codebase review
+   brainstorm (see Docs Review phase).
 
 **Known gaps (accepted for v1):**
 - `mail_send` / `messages_send` / calendar writes validated by mock + gate
