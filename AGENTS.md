@@ -33,8 +33,7 @@ Clipboard on macOS. Rust binary on `rmcp` 3.x; behavior gates live in
 |---|---|
 | Tool signatures, params, example payloads | `docs/tools.md` |
 | Gate mechanics, token stores, TCC permissions | `docs/safety.md` |
-| Architecture, JXA pitfalls, adding a group | `docs/development.md` |
-| Install/config for users | `README.md` |
+| How the system works, request lifecycle, JXA rules, decision records | `docs/architecture.md` |
 | Current build state & next step | `progress.md` |
 | Feature checklist with evidence | `feature_list.json` |
 | One-shot verification command | `init.sh` |
