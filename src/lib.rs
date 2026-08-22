@@ -19,10 +19,19 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 pub mod mail;
+pub mod messages;
+pub mod notifications;
 pub mod util;
 
 use mail::MailToolset;
+use messages::MessagesToolset;
+use notifications::NotificationsToolset;
 use personai_core::macos::{AppleError, RealTransport};
+
+/// Default page size for list/search tools.
+pub(crate) const DEFAULT_LIMIT: u32 = 20;
+/// Hard maximum page size (context discipline: no unbounded blobs).
+pub(crate) const MAX_LIMIT: u32 = 100;
 
 /// Mutable server state shared by all tools.
 ///
@@ -32,6 +41,8 @@ use personai_core::macos::{AppleError, RealTransport};
 /// groups never touch each other.
 pub struct ServerState {
     mail: MailToolset<RealTransport>,
+    messages: MessagesToolset<RealTransport>,
+    notifications: NotificationsToolset<RealTransport>,
 }
 
 /// The MCP server handle passed to every tool method.
@@ -45,12 +56,20 @@ impl MacosServer {
     /// Build a server rooted at `state_dir`; each gated group keeps its own
     /// token store under it (`tokens.mail.json`, `tokens.messages.json`, …).
     pub fn new(state_dir: std::path::PathBuf) -> Self {
+        let gated = |store: &str| state_dir.join(store);
         let state = ServerState {
-            mail: MailToolset::with_gate(RealTransport, state_dir.join("tokens.mail.json"))
-                .unwrap_or_else(|e| {
+            mail: MailToolset::with_gate(RealTransport, gated("tokens.mail.json")).unwrap_or_else(
+                |e| {
                     eprintln!("mail gate unavailable ({e}); mail_send will refuse");
                     MailToolset::new(RealTransport)
+                },
+            ),
+            messages: MessagesToolset::with_gate(RealTransport, gated("tokens.messages.json"))
+                .unwrap_or_else(|e| {
+                    eprintln!("messages gate unavailable ({e}); messages_send will refuse");
+                    MessagesToolset::new(RealTransport)
                 }),
+            notifications: NotificationsToolset::new(RealTransport),
         };
         Self {
             state_dir,
@@ -101,6 +120,81 @@ impl MacosServer {
                 .await,
         )
     }
+
+    // --- Messages ------------------------------------------------------------
+
+    #[tool(
+        description = "Read recent iMessage/SMS history, newest first. Returns {total, offset, limit, messages:[{from, direction, text, date}]}. chat optionally filters by chat id, display name, or participant handle."
+    )]
+    async fn messages_read(&self, Parameters(p): Parameters<MessagesReadParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.messages
+                .read(p.chat, p.limit, p.offset.unwrap_or(0))
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Send an iMessage/SMS. Soft-gated: the first call returns status requires_confirmation with a confirmation_token and does NOT send; re-invoke with confirmation_token to execute. Tokens are single-use and expire in 5 minutes."
+    )]
+    async fn messages_send(&self, Parameters(p): Parameters<MessagesSendParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.messages
+                .send(&p.to, &p.body, p.confirmation_token.as_deref())
+                .await,
+        )
+    }
+
+    // --- Notifications -------------------------------------------------------
+
+    #[tool(
+        description = "Post a local macOS notification banner (title, optional subtitle, message)."
+    )]
+    async fn notifications_post(&self, Parameters(p): Parameters<NotificationParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.notifications
+                .post(&p.title, &p.message, p.subtitle.as_deref())
+                .await,
+        )
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MessagesReadParams {
+    /// Optional chat id, display name, or participant handle filter.
+    #[serde(default)]
+    pub chat: Option<String>,
+    /// Page size (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Page offset (default 0).
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MessagesSendParams {
+    /// Participant handle (phone number or email).
+    pub to: String,
+    /// Message body.
+    pub body: String,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct NotificationParams {
+    /// Banner title.
+    pub title: String,
+    /// Banner message body.
+    pub message: String,
+    /// Optional subtitle.
+    #[serde(default)]
+    pub subtitle: Option<String>,
 }
 
 // --- Tool parameter schemas ---------------------------------------------

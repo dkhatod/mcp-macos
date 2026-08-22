@@ -12,11 +12,7 @@ use personai_core::safety::{GateOutcome, SoftGate};
 use serde_json::{Value, json};
 
 use crate::util::js_str;
-
-/// Default page size for list/search tools.
-pub(crate) const DEFAULT_LIMIT: u32 = 20;
-/// Hard maximum page size (context discipline: no unbounded blobs).
-pub(crate) const MAX_LIMIT: u32 = 100;
+use crate::{DEFAULT_LIMIT, MAX_LIMIT};
 
 /// Apple Mail tool group over any transport.
 pub struct MailToolset<T: AppleTransport> {
