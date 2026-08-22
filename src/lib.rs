@@ -11,8 +11,18 @@
 
 use std::sync::Arc;
 
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::schemars::JsonSchema;
+use rmcp::tool;
 use rmcp::tool_router;
+use serde::Deserialize;
 use tokio::sync::Mutex;
+
+pub mod mail;
+pub mod util;
+
+use mail::MailToolset;
+use personai_core::macos::{AppleError, RealTransport};
 
 /// Mutable server state shared by all tools.
 ///
@@ -20,28 +30,126 @@ use tokio::sync::Mutex;
 /// (transports, gates) lives here behind an async mutex, because tool bodies
 /// await subprocesses while holding the lock. Each field is one tool group;
 /// groups never touch each other.
-#[derive(Default)]
-pub struct ServerState {}
+pub struct ServerState {
+    mail: MailToolset<RealTransport>,
+}
 
 /// The MCP server handle passed to every tool method.
 pub struct MacosServer {
     pub state_dir: std::path::PathBuf,
-    /// Read once the first tool group registers (Mail). The `expect` errors
-    /// as soon as this is actually used — remove it then.
-    #[expect(dead_code)]
     inner: Arc<Mutex<ServerState>>,
 }
 
 #[tool_router(server_handler)]
 impl MacosServer {
-    /// Build a server rooted at `state_dir`.
-    ///
-    /// Tool groups register themselves here as they are implemented; the
-    /// soft-gate token store lives at `<state_dir>/tokens.json`.
+    /// Build a server rooted at `state_dir`; each gated group keeps its own
+    /// token store under it (`tokens.mail.json`, `tokens.messages.json`, …).
     pub fn new(state_dir: std::path::PathBuf) -> Self {
+        let state = ServerState {
+            mail: MailToolset::with_gate(RealTransport, state_dir.join("tokens.mail.json"))
+                .unwrap_or_else(|e| {
+                    eprintln!("mail gate unavailable ({e}); mail_send will refuse");
+                    MailToolset::new(RealTransport)
+                }),
+        };
         Self {
             state_dir,
-            inner: Arc::new(Mutex::new(ServerState {})),
+            inner: Arc::new(Mutex::new(state)),
         }
+    }
+
+    // --- Mail ---------------------------------------------------------------
+
+    #[tool(description = "List Mail account names configured on this Mac.")]
+    async fn mail_list_accounts(&self) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(st.mail.list_accounts().await)
+    }
+
+    #[tool(
+        description = "Search Mail. Returns metadata only (id, subject, from, date, snippet), paginated as {total, offset, limit, results}. Use mail_read for full content."
+    )]
+    async fn mail_search(&self, Parameters(p): Parameters<MailSearchParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.mail
+                .search(
+                    &p.query,
+                    p.account.as_deref(),
+                    p.since.as_deref(),
+                    p.limit,
+                    p.offset.unwrap_or(0),
+                )
+                .await,
+        )
+    }
+
+    #[tool(description = "Read one full Mail message by id (an id from mail_search results).")]
+    async fn mail_read(&self, Parameters(p): Parameters<MailReadParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(st.mail.read(&p.id).await)
+    }
+
+    #[tool(
+        description = "Send an email via Mail. Soft-gated: the first call returns status requires_confirmation with a confirmation_token and does NOT send; re-invoke with confirmation_token to execute. Tokens are single-use and expire in 5 minutes."
+    )]
+    async fn mail_send(&self, Parameters(p): Parameters<MailSendParams>) -> String {
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.mail
+                .send(&p.to, &p.subject, &p.body, p.confirmation_token.as_deref())
+                .await,
+        )
+    }
+}
+
+// --- Tool parameter schemas ---------------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MailSearchParams {
+    /// Case-insensitive text matched against subject or sender.
+    pub query: String,
+    /// Optional Mail account name to search within.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Optional ISO 8601 date; only messages received after this instant.
+    #[serde(default)]
+    pub since: Option<String>,
+    /// Page size (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Page offset (default 0).
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MailReadParams {
+    /// Message id from a mail_search result.
+    pub id: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MailSendParams {
+    /// Recipient address.
+    pub to: String,
+    /// Subject line.
+    pub subject: String,
+    /// Plain-text body.
+    pub body: String,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+// --- Helpers -------------------------------------------------------------
+
+/// Serializes a toolset result into the single-JSON-string response every
+/// tool returns; errors become `{"error": ...}` payloads so the calling
+/// agent always receives structured output.
+fn json_result(r: Result<String, AppleError>) -> String {
+    match r {
+        Ok(s) => s,
+        Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
     }
 }
