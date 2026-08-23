@@ -112,6 +112,10 @@ async fn server_instructions_and_tool_descriptions() {
         instructions.contains("permissions_check"),
         "instructions must point clients to permissions_check: {instructions}"
     );
+    assert!(
+        instructions.contains("folders"),
+        "instructions must document folder selection: {instructions}"
+    );
 
     // tools/list → captures every advertised tool description.
     writer.write_all(INITIALIZED.as_bytes()).await.unwrap();
@@ -139,12 +143,15 @@ async fn server_instructions_and_tool_descriptions() {
         );
     }
 
-    // 2. Gated send/write tools document the token flow.
+    // 2. Gated send/write tools (plus 0.2.0's forward/reply) document the
+    // token flow.
     for gated in [
         "mail_send",
         "messages_send",
         "calendar_create",
         "calendar_update",
+        "mail_forward",
+        "mail_reply",
     ] {
         let desc = tools
             .iter()
@@ -155,6 +162,14 @@ async fn server_instructions_and_tool_descriptions() {
         assert!(
             desc.contains("confirmation_token"),
             "gated tool '{gated}' must document confirmation_token: {desc}"
+        );
+    }
+
+    // 2b. 0.2.0 tools must be advertised (presence, not count).
+    for required in ["mail_forward", "mail_reply", "mail_config"] {
+        assert!(
+            tools.iter().any(|t| t["name"].as_str() == Some(required)),
+            "tools/list must advertise '{required}'"
         );
     }
 
@@ -171,6 +186,18 @@ async fn server_instructions_and_tool_descriptions() {
             "ungated tool '{ungated}' must not mention confirmation_token: {desc}"
         );
     }
+
+    // 4. The mail_config doctor documents itself as read-only.
+    let config_desc = tools
+        .iter()
+        .find(|t| t["name"].as_str() == Some("mail_config"))
+        .unwrap_or_else(|| panic!("mail_config was not advertised"))["description"]
+        .as_str()
+        .expect("description");
+    assert!(
+        config_desc.contains("Read-only"),
+        "mail_config must describe itself as read-only: {config_desc}"
+    );
 
     // In-memory transport never signals EOF cleanly; kill the session task.
     drop(writer);
@@ -189,7 +216,12 @@ async fn enabled_tools_trim_discovery_and_calls() {
         notifications: false,
         clipboard: false,
     };
-    let server = mcp_macos::MacosServer::new_with_tools(dir.path().to_path_buf(), enabled);
+    let server = mcp_macos::MacosServer::new_with_tools(
+        dir.path().to_path_buf(),
+        enabled,
+        mcp_macos::policy::MailPolicy::default(),
+        mcp_macos::policy::EffectiveScope::open(),
+    );
 
     let (client, server_io) = tokio::io::duplex(64 * 1024);
     let (reader, mut writer) = tokio::io::split(client);

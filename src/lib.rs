@@ -25,6 +25,7 @@ pub mod mail;
 pub mod messages;
 pub mod notifications;
 pub mod permissions;
+pub mod policy;
 pub mod util;
 
 use calendar::CalendarToolset;
@@ -32,7 +33,7 @@ use clipboard::ClipboardToolset;
 use mail::MailToolset;
 use messages::MessagesToolset;
 use notifications::NotificationsToolset;
-use personai_core::macos::{AppleError, RealTransport};
+use personai_core::macos::{AppleError, JxaTransport};
 
 /// Default page size for list/search tools.
 pub(crate) const DEFAULT_LIMIT: u32 = 20;
@@ -102,7 +103,7 @@ impl EnabledTools {
         } else {
             true // permissions_check and future ungrouped tools
         };
-        on || tool_name == "permissions_check"
+        on || tool_name == "permissions_check" || tool_name == "mail_config"
     }
 }
 
@@ -113,57 +114,87 @@ impl EnabledTools {
 /// await subprocesses while holding the lock. Each field is one tool group;
 /// groups never touch each other.
 pub struct ServerState {
-    mail: MailToolset<RealTransport>,
-    messages: MessagesToolset<RealTransport>,
-    calendar: CalendarToolset<RealTransport>,
-    notifications: NotificationsToolset<RealTransport>,
+    mail: MailToolset<JxaTransport>,
+    messages: MessagesToolset<JxaTransport>,
+    calendar: CalendarToolset<JxaTransport>,
+    notifications: NotificationsToolset<JxaTransport>,
     clipboard: ClipboardToolset,
 }
 
 /// The MCP server handle passed to every tool method.
+///
+/// Carries the effective Mail scope (`scope`) and configured identity/folder
+/// policy (`policy`) on top of the mutable toolset state; mail tools resolve
+/// and validate against them before delegating.
 pub struct MacosServer {
     pub state_dir: std::path::PathBuf,
     enabled: EnabledTools,
+    scope: policy::EffectiveScope,
+    policy: Arc<policy::MailPolicy>,
     inner: Arc<Mutex<ServerState>>,
 }
 
 #[tool_router]
 impl MacosServer {
-    /// Build a server rooted at `state_dir` with every group enabled; each
-    /// gated group keeps its own token store under it (`tokens.mail.json`,
-    /// `tokens.messages.json`, …).
+    /// Build a server rooted at `state_dir` with every group enabled, an
+    /// open Mail scope and default policy (degraded mode — tests and
+    /// unconfigured use); each gated group keeps its own token store under
+    /// `state_dir` (`tokens.mail.json`, `tokens.messages.json`, …).
     pub fn new(state_dir: std::path::PathBuf) -> Self {
-        Self::new_with_tools(state_dir, EnabledTools::all())
+        Self::new_with_tools(
+            state_dir,
+            EnabledTools::all(),
+            policy::MailPolicy::default(),
+            policy::EffectiveScope::open(),
+        )
     }
 
-    /// Build a server exposing only the enabled groups (spec §11.1).
-    pub fn new_with_tools(state_dir: std::path::PathBuf, enabled: EnabledTools) -> Self {
+    /// Build a server exposing only the enabled groups (spec §11.1), with
+    /// the Mail identity/folder policy and effective scope resolved by the
+    /// caller (`main.rs`: CLI/file policy validated against live folders).
+    pub fn new_with_tools(
+        state_dir: std::path::PathBuf,
+        enabled: EnabledTools,
+        policy: policy::MailPolicy,
+        scope: policy::EffectiveScope,
+    ) -> Self {
         let gated = |store: &str| state_dir.join(store);
         let state = ServerState {
-            mail: MailToolset::with_gate(RealTransport, gated("tokens.mail.json")).unwrap_or_else(
+            mail: MailToolset::with_gate(JxaTransport, gated("tokens.mail.json")).unwrap_or_else(
                 |e| {
                     eprintln!("mail gate unavailable ({e}); mail_send will refuse");
-                    MailToolset::new(RealTransport)
+                    MailToolset::new(JxaTransport)
                 },
             ),
-            messages: MessagesToolset::with_gate(RealTransport, gated("tokens.messages.json"))
+            messages: MessagesToolset::with_gate(JxaTransport, gated("tokens.messages.json"))
                 .unwrap_or_else(|e| {
                     eprintln!("messages gate unavailable ({e}); messages_send will refuse");
-                    MessagesToolset::new(RealTransport)
+                    MessagesToolset::new(JxaTransport)
                 }),
-            calendar: CalendarToolset::with_gate(RealTransport, gated("tokens.calendar.json"))
+            calendar: CalendarToolset::with_gate(JxaTransport, gated("tokens.calendar.json"))
                 .unwrap_or_else(|e| {
                     eprintln!("calendar gate unavailable ({e}); writes will refuse");
-                    CalendarToolset::new(RealTransport)
+                    CalendarToolset::new(JxaTransport)
                 }),
-            notifications: NotificationsToolset::new(RealTransport),
+            notifications: NotificationsToolset::new(JxaTransport),
             clipboard: ClipboardToolset::new(),
         };
         Self {
             state_dir,
             enabled,
+            policy: Arc::new(policy),
+            scope,
             inner: Arc::new(Mutex::new(state)),
         }
+    }
+
+    /// Actionable out-of-scope error for a folder selection, carrying the
+    /// effective allowlist (`EffectiveScope::summary`, capped at 20 entries).
+    fn out_of_scope(folder: &str, scope: &policy::EffectiveScope) -> AppleError {
+        AppleError::Transport(format!(
+            "folder '{folder}' outside configured scope; valid: {:?}",
+            scope.summary()
+        ))
     }
 
     fn disabled(group: &str) -> String {
@@ -202,22 +233,77 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Search Mail metadata (id, subject, from, date, snippet — never bodies), paginated as {total, offset, limit, results}. By default searches the unified inbox of ALL accounts; pass account to narrow to one account's inbox, or account+mailbox for a specific mailbox (use mail_list_mailboxes to discover them). Use mail_read for full content. Params: since=ISO 8601 (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); account/mailbox are exact name matches (use mail_list_mailboxes). Example: mail_search(query=\"interview\", since=\"2026-08-23\").",
+        description = "Search Mail metadata (id, subject, from, date, snippet, folder — never bodies), paginated as {total, offset, limit, results, scanned_per_folder, truncated}. Pass folders=[\"Account/Mailbox\", …] to select one or more specific mailboxes for this call (each entry must lie inside the configured scope — run mail_config to see it; split on the last '/'); otherwise account narrows to that account's inbox (account+mailbox targets a specific mailbox), and with neither the unified inbox of ALL accounts is searched. truncated:true means the scan budget expired mid-search: results are partial, with per-folder counts in scanned_per_folder. Use mail_read for full content. Params: since=ISO 8601 (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); limit/offset page the merged results (default 20, max 100). Example: mail_search(query=\"interview\", folders=[\"iCloud/Inbox\"]).",
         annotations(read_only_hint = true)
     )]
     async fn mail_search(&self, Parameters(p): Parameters<MailSearchParams>) -> String {
         if !self.enabled.mail {
             return Self::disabled("mail");
         }
+        // Legacy sugar kept intact: a bare `account` still means that
+        // account's inbox via the single-target engine.
+        if p.folders.as_ref().is_none_or(Vec::is_empty)
+            && p.mailbox.is_none()
+            && p.account.is_some()
+        {
+            let mut st = self.inner.lock().await;
+            return json_result(
+                st.mail
+                    .search(
+                        &p.query,
+                        p.account.as_deref(),
+                        None,
+                        p.since.as_deref(),
+                        p.limit,
+                        p.offset.unwrap_or(0),
+                    )
+                    .await,
+            );
+        }
+        // Per-call selection within the effective scope. Each entry is
+        // "Account/Mailbox", split on the LAST '/'; violations are rejected
+        // before any transport work, with the ≤20-entry valid list attached.
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        if let Some(folders) = &p.folders {
+            for f in folders.iter().filter(|f| !f.is_empty()) {
+                match f.rsplit_once('/') {
+                    Some((account, mailbox)) if self.scope.allows(account, mailbox) => {
+                        if !pairs.iter().any(|(a, m)| a == account && m == mailbox) {
+                            pairs.push((account.to_string(), mailbox.to_string()));
+                        }
+                    }
+                    _ => return json_result(Err(Self::out_of_scope(f, &self.scope))),
+                }
+            }
+        }
+        let targets = if pairs.is_empty() {
+            // No `folders` (or all blank): fall back to the legacy sugar,
+            // validated against the same scope.
+            match (p.account.as_deref(), p.mailbox.as_deref()) {
+                (Some(account), Some(mailbox)) => {
+                    if self.scope.allows(account, mailbox) {
+                        mail::MailTargets::Folders(vec![(account.to_string(), mailbox.to_string())])
+                    } else {
+                        return json_result(Err(Self::out_of_scope(
+                            &format!("{account}/{mailbox}"),
+                            &self.scope,
+                        )));
+                    }
+                }
+                _ => mail::MailTargets::Unified,
+            }
+        } else {
+            mail::MailTargets::Folders(pairs)
+        };
+        let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let mut st = self.inner.lock().await;
         json_result(
             st.mail
-                .search(
+                .search_multi(
+                    &targets,
                     &p.query,
-                    p.account.as_deref(),
-                    p.mailbox.clone(),
                     p.since.as_deref(),
-                    p.limit,
+                    limit,
                     p.offset.unwrap_or(0),
                 )
                 .await,
@@ -237,7 +323,7 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Send an email via Mail. Soft-gated: the first call returns status requires_confirmation with a confirmation_token and does NOT send; re-invoke with confirmation_token to execute. Tokens are single-use and expire in 5 minutes.",
+        description = "Send an email via Mail, optionally from a specific identity: from takes a live account name or its primary email (see mail_list_accounts); when omitted, the configured default_from applies, else Mail's own default. Invalid identities are rejected with a valid_from list. Soft-gated: the first call returns status requires_confirmation with a confirmation_token and does NOT send; re-invoke with confirmation_token to execute. Tokens are single-use and expire in 5 minutes. Example: mail_send(to=\"peer@example.com\", subject=\"Lunch\", body=\"Noon ok?\").",
         annotations(destructive_hint = true)
     )]
     async fn mail_send(&self, Parameters(p): Parameters<MailSendParams>) -> String {
@@ -245,11 +331,120 @@ impl MacosServer {
             return Self::disabled("mail");
         }
         let mut st = self.inner.lock().await;
+        // Identity policy: an explicit `from` must match a live account by
+        // name or primary email (case-insensitive) before anything sends.
+        let from = match p.from.as_deref() {
+            None => None,
+            Some(want) => {
+                let raw = match st.mail.list_accounts().await {
+                    Ok(s) => s,
+                    Err(e) => return json_result(Err(e)),
+                };
+                let parsed: serde_json::Value = match serde_json::from_str(&raw) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return json_result(Err(AppleError::Transport(format!(
+                            "unreadable Mail account listing: {e}"
+                        ))));
+                    }
+                };
+                let accounts = parsed
+                    .get("accounts")
+                    .and_then(serde_json::Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                fn name_of(a: &serde_json::Value) -> &str {
+                    a.get("name")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                }
+                fn email_of(a: &serde_json::Value) -> &str {
+                    a.get("email")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                }
+                let hit = accounts.iter().any(|a| {
+                    name_of(a).eq_ignore_ascii_case(want)
+                        || (!email_of(a).is_empty() && email_of(a).eq_ignore_ascii_case(want))
+                });
+                if !hit {
+                    let valid_from: Vec<String> = accounts
+                        .iter()
+                        .take(20)
+                        .map(|a| match email_of(a) {
+                            "" => name_of(a).to_string(),
+                            email => format!("{} <{email}>", name_of(a)),
+                        })
+                        .collect();
+                    return json_result(Err(AppleError::Transport(format!(
+                        "from '{want}' is not a configured Mail account; valid_from: {valid_from:?}"
+                    ))));
+                }
+                Some(want.to_string())
+            }
+        };
         json_result(
             st.mail
-                .send(&p.to, &p.subject, &p.body, p.confirmation_token.as_deref())
+                .send(
+                    &p.to,
+                    &p.subject,
+                    &p.body,
+                    from.as_deref(),
+                    p.confirmation_token.as_deref(),
+                )
                 .await,
         )
+    }
+
+    #[tool(
+        description = "Forward an existing Mail message to a recipient using Mail's native forward verb — sent from the account owning the source message, threading headers preserved. comment adds optional text above the forwarded content. Soft-gated: the first call returns status requires_confirmation with a confirmation_token and does NOT forward; re-invoke with confirmation_token to execute. Tokens are single-use and expire in 5 minutes. Example: mail_forward(id=\"A1B2\", to=\"team@example.com\").",
+        annotations(destructive_hint = true)
+    )]
+    async fn mail_forward(&self, Parameters(p): Parameters<MailForwardParams>) -> String {
+        if !self.enabled.mail {
+            return Self::disabled("mail");
+        }
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.mail
+                .forward(
+                    &p.id,
+                    &p.to,
+                    p.comment.as_deref(),
+                    p.confirmation_token.as_deref(),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Reply to an existing Mail message using Mail's native reply verb — sent from the account owning the source message, threading headers preserved; body supplies the reply text (recipients come from the original). Soft-gated: the first call returns status requires_confirmation with a confirmation_token and does NOT send; re-invoke with confirmation_token to execute. Tokens are single-use and expire in 5 minutes. Example: mail_reply(id=\"A1B2\", body=\"Confirmed, thanks!\").",
+        annotations(destructive_hint = true)
+    )]
+    async fn mail_reply(&self, Parameters(p): Parameters<MailReplyParams>) -> String {
+        if !self.enabled.mail {
+            return Self::disabled("mail");
+        }
+        let mut st = self.inner.lock().await;
+        json_result(
+            st.mail
+                .reply(&p.id, &p.body, p.confirmation_token.as_deref())
+                .await,
+        )
+    }
+
+    #[tool(
+        description = "Read-only doctor for the active Mail scope policy: returns {mode, folders, default_from, deny_set}, where mode is \"open\", \"explicit\" or \"default-deny-set\", folders lists the effective allowlist of Account/Mailbox entries accepted by mail_search, default_from is the fallback send identity and deny_set the mailbox names excluded when no explicit allowlist is configured. No arguments, no side effects.",
+        annotations(read_only_hint = true)
+    )]
+    async fn mail_config(&self) -> String {
+        serde_json::json!({
+            "mode": self.scope.mode(),
+            "folders": self.scope.summary(),
+            "default_from": self.policy.default_from.clone(),
+            "deny_set": policy::DEFAULT_DENY,
+        })
+        .to_string()
     }
 
     // --- Messages -----------------------------------------------------------
@@ -423,8 +618,8 @@ impl MacosServer {
 #[tool_handler(
     router = Self::tool_router(),
     name = "mcp-macos",
-    version = "0.1.2",
-    instructions = "Purpose-built Mail/Messages/Calendar/Notifications/Clipboard tools; prefer them over raw osascript/AppleScript. List/search results are summary-first metadata + snippet, never bodies — fetch full content by id with mail_read/messages_read. Paginated `offset`+`limit` (default 20, max 100). Sends and calendar writes are soft-gated: first call returns `requires_confirmation` + a single-use confirmation_token (5-min TTL); re-invoke with the token to execute. Reads, notifications, and clipboard are ungated. On permission errors, run `permissions_check` first. For status/history, consult the personai state directory before querying these apps."
+    version = "0.1.3",
+    instructions = "Purpose-built Mail/Messages/Calendar/Notifications/Clipboard tools; prefer them over raw osascript/AppleScript. List/search results are summary-first metadata + snippet, never bodies — fetch full content by id with mail_read/messages_read. Paginated `offset`+`limit` (default 20, max 100). Sends and calendar writes are soft-gated: first call returns `requires_confirmation` + a single-use confirmation_token (5-min TTL); re-invoke with the token to execute. Reads, notifications, and clipboard are ungated. On permission errors, run `permissions_check` first. For status/history, consult the personai state directory before querying these apps. Mail access is selection-within-an-allowlist: mail_config reports the effective scope, and mail_search takes folders=[\"Account/Mailbox\", …] to pick any targets inside it per call. mail_forward/mail_reply send from the account owning the source message; a truncated:true search result means the scan hit its time budget and returned partial results (per-folder counts in scanned_per_folder)."
 )]
 impl rmcp::ServerHandler for MacosServer {
     async fn list_tools(
@@ -461,6 +656,12 @@ pub struct MailSearchParams {
     /// in the inbox). Discover via mail_list_mailboxes.
     #[serde(default)]
     pub mailbox: Option<String>,
+    /// Optional per-call folder selection: `["Account/Mailbox", …]` (split
+    /// on the last '/'). Every entry must lie inside the configured scope —
+    /// run mail_config for the current allowlist. Takes precedence over
+    /// account/mailbox.
+    #[serde(default)]
+    pub folders: Option<Vec<String>>,
     /// Optional ISO 8601 date; only messages received after this instant.
     #[serde(default)]
     pub since: Option<String>,
@@ -492,6 +693,36 @@ pub struct MailSendParams {
     /// Subject line.
     pub subject: String,
     /// Plain-text body.
+    pub body: String,
+    /// Optional sender identity: a live account name or its primary email
+    /// (see mail_list_accounts). Omit for the configured default_from, else
+    /// Mail's own default. Invalid values are rejected with a valid_from list.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MailForwardParams {
+    /// Message id from a mail_search result.
+    pub id: String,
+    /// Recipient address for the forwarded message.
+    pub to: String,
+    /// Optional comment placed above the forwarded content.
+    #[serde(default)]
+    pub comment: Option<String>,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MailReplyParams {
+    /// Message id from a mail_search result.
+    pub id: String,
+    /// Plain-text reply body (recipients come from the original message).
     pub body: String,
     /// Token from a previous requires_confirmation response.
     #[serde(default)]

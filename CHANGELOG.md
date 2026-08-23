@@ -3,6 +3,40 @@
 All notable changes. Format follows [Keep a Changelog](https://keepachangelog.com);
 versions are semver (0.x: breaking changes bump minor).
 
+## [0.1.3] — 2026-08-23
+
+### Added
+- Folder-scoped search: `mail_search` accepts an optional `folders`
+  parameter (`Account/Mailbox` targets, validated against the configured
+  allowlist); multi-folder searches run one JXA pass across all targets
+  under a shared wall-clock budget and report `scanned_per_folder` plus
+  `truncated` when the budget expires.
+- Detailed mailbox listing: per-mailbox message counts, last-activity
+  timestamps, and whether each mailbox is inside the configured scope.
+- Soft-gated `mail_forward` and `mail_reply`, using the same single-use,
+  5-minute confirmation-token flow as sends; both operate on the source
+  message so Mail forwards/replies from its account.
+- Read-only `mail_config` doctor reporting the effective scope mode, the
+  resolved folder list, the default send identity, and the deny set.
+- Configuration file (`~/.personai/state/mcp-macos.json`) plus CLI flags
+  (`--mail-folders`, `--mail-default-from`) for the mail allowlist and
+  default send identity; unknown config entries warn and are dropped,
+  never fatal.
+
+### Changed
+- `mail_send` accepts an optional `from` address, validated against live
+  accounts; when given, outgoing messages are sent from the matching
+  account.
+- Server `instructions` document the folder-selection model alongside the
+  existing pagination and gate guidance.
+
+### Fixed
+- The server now executes every tool through JXA (`osascript -l
+  JavaScript`). 0.1.x constructed the production transport in default
+  (AppleScript) mode, so live tool calls failed with a `-2741` syntax
+  error; the mock-transport test suite could not catch it. Real-Mac tests
+  already exercised `JxaTransport` directly and kept passing.
+
 ## [0.1.2] — 2026-08-23
 
 ### Added

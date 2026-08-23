@@ -22,6 +22,15 @@ pub struct MailToolset<T: AppleTransport> {
     pub gate: Option<SoftGate>,
 }
 
+/// Search targets for [`MailToolset::search_multi`].
+#[derive(Clone, Debug)]
+pub enum MailTargets {
+    /// The unified inbox across every account.
+    Unified,
+    /// Explicit `(account, mailbox)` pairs.
+    Folders(Vec<(String, String)>),
+}
+
 impl<T: AppleTransport> MailToolset<T> {
     pub fn new(transport: T) -> Self {
         Self {
@@ -39,6 +48,24 @@ impl<T: AppleTransport> MailToolset<T> {
                     .map_err(|e| AppleError::Transport(format!("gate unavailable: {e}")))?,
             ),
         })
+    }
+    /// Runs the soft-gate check shared by send/forward/reply. Refuses when
+    /// no gate is configured.
+    async fn gated(
+        &mut self,
+        action: &str,
+        payload: &Value,
+        token: Option<&str>,
+    ) -> Result<GateOutcome, AppleError> {
+        match self.gate.as_mut() {
+            Some(gate) => gate
+                .check(action, payload, token)
+                .await
+                .map_err(|e| AppleError::Transport(format!("gate error: {e}"))),
+            None => Err(AppleError::Transport(format!(
+                "soft gate not configured — refusing {action}"
+            ))),
+        }
     }
 
     /// Lists configured Mail accounts with identity fields, so agents can
@@ -64,6 +91,20 @@ impl<T: AppleTransport> MailToolset<T> {
     /// like Work/Important are separate mailboxes outside the inbox.
     pub async fn list_mailboxes(&mut self, account: Option<String>) -> Result<String, AppleError> {
         let v = run_jxa_json(&mut self.transport, &mailboxes_expr(account.as_deref())).await?;
+        Ok(v.to_string())
+    }
+    /// Lists mailboxes with counts plus each box's most recent activity
+    /// (`last_activity` ISO timestamp or null, best-effort) so agents can
+    /// pick live, active folders without opening Mail.
+    pub async fn list_mailboxes_detailed(
+        &mut self,
+        account: Option<String>,
+    ) -> Result<String, AppleError> {
+        let v = run_jxa_json(
+            &mut self.transport,
+            &mailboxes_detailed_expr(account.as_deref()),
+        )
+        .await?;
         Ok(v.to_string())
     }
 
@@ -110,44 +151,144 @@ impl<T: AppleTransport> MailToolset<T> {
         .to_string())
     }
 
+    /// Searches one or more targets with a SINGLE script and merges the
+    /// matches date-descending. A wall-clock budget ([`GLOBAL_BUDGET_MS`])
+    /// is checked between targets: expiry stops the sweep early and
+    /// `truncated: true` reports the partial coverage. Payload:
+    /// `{total, offset, limit, results, scanned_per_folder, truncated}`
+    /// where each result carries its `folder` tag (`"Account/Mailbox"`).
+    /// Metadata only — never bodies.
+    pub async fn search_multi(
+        &mut self,
+        targets: &MailTargets,
+        query: &str,
+        since: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<String, AppleError> {
+        let v = run_jxa_json(
+            &mut self.transport,
+            &search_multi_expr(targets, query, since, limit, offset),
+        )
+        .await?;
+
+        let total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let mut results = v
+            .get("results")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        // Defense in depth, identical to `search`: even if a script ever
+        // returned bodies, the toolset strips them and caps the page.
+        for r in results.iter_mut() {
+            if let Some(o) = r.as_object_mut() {
+                o.remove("body");
+                o.remove("content");
+            }
+        }
+        results.truncate(limit as usize);
+        Ok(json!({
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "results": results,
+            "scanned_per_folder": v
+                .get("scanned_per_folder")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+            "truncated": v
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+        .to_string())
+    }
+
     /// Reads one full message by id (from `search` results).
     pub async fn read(&mut self, id: &str) -> Result<String, AppleError> {
         let v = run_jxa_json(&mut self.transport, &read_expr(id)).await?;
         Ok(v.to_string())
     }
 
+    /// Forwards a message by id (from `search` results) to `to`. Without a
+    /// valid `token` nothing is sent: the caller gets back the exact
+    /// payload plus a fresh confirmation token instead. Mail's native
+    /// forward pins the source message's account, preserving threading.
+    pub async fn forward(
+        &mut self,
+        id: &str,
+        to: &str,
+        comment: Option<&str>,
+        token: Option<&str>,
+    ) -> Result<String, AppleError> {
+        let payload = json!({ "id": id, "to": to, "comment": comment });
+        match self.gated("mail.forward", &payload, token).await? {
+            GateOutcome::Confirm { payload, token } => Ok(json!({
+                "status": "requires_confirmation",
+                "payload": payload,
+                "confirmation_token": token,
+                "note": "Show this payload to the user; re-invoke mail_forward with confirmation_token to execute.",
+            })
+            .to_string()),
+            GateOutcome::Execute => {
+                run_jxa_json(&mut self.transport, &forward_expr(id, to, comment)).await?;
+                Ok(json!({ "status": "forwarded", "id": id, "to": to }).to_string())
+            }
+        }
+    }
+
+    /// Replies to a message by id (from `search` results) with `body`.
+    /// Same soft-gate contract as [`MailToolset::forward`]: no token, no
+    /// send — just the payload plus a fresh confirmation token.
+    pub async fn reply(
+        &mut self,
+        id: &str,
+        body: &str,
+        token: Option<&str>,
+    ) -> Result<String, AppleError> {
+        let payload = json!({ "id": id, "body": body });
+        match self.gated("mail.reply", &payload, token).await? {
+            GateOutcome::Confirm { payload, token } => Ok(json!({
+                "status": "requires_confirmation",
+                "payload": payload,
+                "confirmation_token": token,
+                "note": "Show this payload to the user; re-invoke mail_reply with confirmation_token to execute.",
+            })
+            .to_string()),
+            GateOutcome::Execute => {
+                run_jxa_json(&mut self.transport, &reply_expr(id, body)).await?;
+                Ok(json!({ "status": "replied", "id": id }).to_string())
+            }
+        }
+    }
+
     /// Sends an email. Without a valid `token` the send does not happen:
     /// the caller gets back the exact payload plus a fresh confirmation
-    /// token instead.
+    /// token instead. `from` optionally selects the outgoing account by
+    /// display name OR primary email address (case-insensitive); omitted,
+    /// Mail uses the default account.
     pub async fn send(
         &mut self,
         to: &str,
         subject: &str,
         body: &str,
+        from: Option<&str>,
         token: Option<&str>,
     ) -> Result<String, AppleError> {
-        let payload = json!({ "to": to, "subject": subject, "body": body });
-        let outcome = match self.gate.as_mut() {
-            Some(gate) => gate
-                .check("mail.send", &payload, token)
-                .await
-                .map_err(|e| AppleError::Transport(format!("gate error: {e}")))?,
-            None => {
-                return Err(AppleError::Transport(String::from(
-                    "soft gate not configured — refusing to send",
-                )));
-            }
-        };
-        match outcome {
+        let mut payload = json!({ "to": to, "subject": subject, "body": body });
+        if let Some(f) = from {
+            payload["from"] = json!(f);
+        }
+        match self.gated("mail.send", &payload, token).await? {
             GateOutcome::Confirm { payload, token } => Ok(json!({
                 "status": "requires_confirmation",
                 "payload": payload,
                 "confirmation_token": token,
-                "note": "Show this payload to the user; re-invoke mail_send with confirmation_token to execute.",
+                "note": "Show this payload to the user; re-invoke mail_send with confirmation_token to execute. Optionally pass from to pick the sending identity (see list_accounts); omit it for the default account.",
             })
             .to_string()),
             GateOutcome::Execute => {
-                run_jxa_json(&mut self.transport, &send_expr(to, subject, body)).await?;
+                run_jxa_json(&mut self.transport, &send_expr(to, subject, body, from)).await?;
                 Ok(json!({ "status": "sent", "to": to, "subject": subject }).to_string())
             }
         }
@@ -164,6 +305,11 @@ impl<T: AppleTransport> MailToolset<T> {
 /// through a `whose(...)` specifier re-evaluates the whole query per item
 /// and times out on real mailboxes.
 const SCAN_MAX: u32 = 1000;
+
+/// Wall-clock budget for [`MailToolset::search_multi`], checked inside the
+/// JXA loop between targets; expiry yields a partial result with
+/// `truncated: true` instead of an error.
+const GLOBAL_BUDGET_MS: u64 = 25_000;
 
 fn search_expr(
     query: &str,
@@ -238,6 +384,103 @@ fn search_expr(
     )
 }
 
+/// One script across ALL [`MailTargets`]: per target four bulk Apple
+/// Events sliced to [`SCAN_MAX`], JS filtering identical to
+/// [`search_expr`], a `"Account/Mailbox"` folder tag per hit, a global
+/// date-descending merge, pagination, and the [`GLOBAL_BUDGET_MS`] check
+/// between targets. Unified mode scans the unified inbox under the tag
+/// `Unified/Inbox` (per-message account attribution would cost one event
+/// per message).
+fn search_multi_expr(
+    targets: &MailTargets,
+    query: &str,
+    since: Option<&str>,
+    limit: u32,
+    offset: u32,
+) -> String {
+    let q = js_str(&query.to_lowercase());
+    let since_clause = match since {
+        Some(iso) => format!("const sinceMs = Date.parse({});", js_str(iso)),
+        None => "const sinceMs = null;".to_string(),
+    };
+    let targets_js = match targets {
+        MailTargets::Unified => "[{u: true}]".to_string(),
+        MailTargets::Folders(pairs) => {
+            let items: Vec<String> = pairs
+                .iter()
+                .map(|(a, b)| format!("{{a: {}, b: {}}}", js_str(a), js_str(b)))
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+    };
+    format!(
+        r#"(() => {{
+  const M = Application('Mail');
+  const BUDGET_MS = {GLOBAL_BUDGET_MS};
+  const t0 = Date.now();
+  {since_clause}
+  const qLower = {q};
+  const targets = {targets_js};
+  const merged = [];
+  const scannedPerFolder = {{}};
+  let truncated = false;
+  for (const t of targets) {{
+    if (Date.now() - t0 > BUDGET_MS) {{ truncated = true; break; }}
+    let label, box;
+    try {{
+      if (t.u) {{
+        box = M.inbox();
+        label = 'Unified/Inbox';
+      }} else {{
+        label = t.a + '/' + t.b;
+        box = M.accounts.whose({{name: t.a}})()[0].mailboxes.whose({{name: t.b}})()[0];
+      }}
+    }} catch (e) {{ continue; }}
+    const scan = Math.min(box.messages.length, {SCAN_MAX});
+    scannedPerFolder[label] = scan;
+    const ids = box.messages.id().slice(0, scan);
+    const subjects = box.messages.subject().slice(0, scan);
+    const senders = box.messages.sender().slice(0, scan);
+    const dates = box.messages.dateReceived().slice(0, scan);
+    for (let i = 0; i < ids.length; i++) {{
+      if (sinceMs !== null && (!dates[i] || dates[i].getTime() < sinceMs)) continue;
+      if ((subjects[i] && subjects[i].toLowerCase().includes(qLower)) ||
+          (senders[i] && senders[i].toLowerCase().includes(qLower))) {{
+        merged.push({{
+          id: String(ids[i]),
+          subject: subjects[i],
+          from: senders[i],
+          ms: dates[i].getTime(),
+          date: dates[i].toISOString(),
+          snippet: '',
+          folder: label,
+          ref: box.messages[i],
+        }});
+      }}
+    }}
+  }}
+  merged.sort((x, y) => y.ms - x.ms);
+  const total = merged.length;
+  const end = Math.min({offset} + {limit}, total);
+  const out = [];
+  for (let k = {offset}; k < end; k++) {{
+    const e = merged[k];
+    let snippet = '';
+    try {{ snippet = String(e.ref.content()).slice(0, 140); }} catch (err) {{}}
+    out.push({{
+      id: e.id,
+      subject: e.subject,
+      from: e.from,
+      date: e.date,
+      snippet: snippet,
+      folder: e.folder,
+    }});
+  }}
+  return {{total: total, results: out, scanned_per_folder: scannedPerFolder, truncated: truncated}};
+}})()"#
+    )
+}
+
 /// Enumerates mailboxes with message counts. Full sweep of 3 accounts /
 /// ~42 mailboxes measured at ~2 s live; `account` narrows to one account.
 fn mailboxes_expr(account: Option<&str>) -> String {
@@ -258,6 +501,49 @@ fn mailboxes_expr(account: Option<&str>) -> String {
       let count = 0;
       try {{ count = mb.messages.length; }} catch (e) {{}}
       mailboxes.push({{account: acctName, name: mb.name(), count: count}});
+    }}
+  }}
+  return {{mailboxes: mailboxes}};
+}})()"#
+    )
+}
+
+/// Like [`mailboxes_expr`] but also reports each mailbox's newest message
+/// date (`last_activity`, ISO or null) from a bounded tail sample of up to
+/// 50 messages — best-effort, never fatal.
+fn mailboxes_detailed_expr(account: Option<&str>) -> String {
+    let account_clause = match account {
+        Some(name) => format!(
+            "const accounts = M.accounts.whose({{name: {}}})().map(a => [a.name(), a]);",
+            js_str(name)
+        ),
+        None => "const accounts = M.accounts().map(a => [a.name(), a]);".to_string(),
+    };
+    format!(
+        r#"(() => {{
+  const M = Application('Mail');
+  {account_clause}
+  const mailboxes = [];
+  for (const [acctName, a] of accounts) {{
+    for (const mb of a.mailboxes()) {{
+      let count = 0;
+      try {{ count = mb.messages.length; }} catch (e) {{}}
+      let lastActivity = null;
+      try {{
+        if (count > 0) {{
+          const tail = Math.min(count, 50);
+          const ds = mb.messages.dateReceived().slice(count - tail);
+          let mx = 0;
+          for (const d of ds) {{ const t = d.getTime(); if (t > mx) mx = t; }}
+          if (mx > 0) lastActivity = new Date(mx).toISOString();
+        }}
+      }} catch (e) {{}}
+      mailboxes.push({{
+        account: acctName,
+        name: mb.name(),
+        count: count,
+        last_activity: lastActivity,
+      }});
     }}
   }}
   return {{mailboxes: mailboxes}};
@@ -287,18 +573,84 @@ fn read_expr(id: &str) -> String {
     )
 }
 
-fn send_expr(to: &str, subject: &str, body: &str) -> String {
+/// Looks up a message by id exactly like [`read_expr`], runs Mail's native
+/// `forward` verb addressed to `to`, attaches the optional comment to the
+/// draft (best-effort), and sends it from the source message's account.
+fn forward_expr(id: &str, to: &str, comment: Option<&str>) -> String {
+    let id = js_str(id);
+    let to = js_str(to);
+    let comment_clause = match comment {
+        Some(c) => format!("  try {{ fw.comment = {}; }} catch (e) {{}}\n", js_str(c)),
+        None => String::new(),
+    };
+    format!(
+        r#"(() => {{
+  const M = Application('Mail');
+  const wanted = Number({id});
+  const hits = M.inbox().messages.whose({{id: wanted}});
+  if (hits.length === 0) throw new Error('message not found: ' + {id});
+  const fw = hits[0].forward({{to: {to}}});
+{comment_clause}  fw.send();
+  return {{status: 'forwarded'}};
+}})()"#
+    )
+}
+
+/// Looks up a message by id exactly like [`read_expr`], runs Mail's native
+/// `reply` verb, replaces the draft content with `body`, and sends it from
+/// the source message's account.
+fn reply_expr(id: &str, body: &str) -> String {
+    let id = js_str(id);
+    let body = js_str(body);
+    format!(
+        r#"(() => {{
+  const M = Application('Mail');
+  const wanted = Number({id});
+  const hits = M.inbox().messages.whose({{id: wanted}});
+  if (hits.length === 0) throw new Error('message not found: ' + {id});
+  const rp = hits[0].reply();
+  rp.content = {body};
+  rp.send();
+  return {{status: 'replied'}};
+}})()"#
+    )
+}
+
+fn send_expr(to: &str, subject: &str, body: &str, from: Option<&str>) -> String {
+    // Identity selection: case-insensitive match on account display name
+    // or primary email address. No `from` means Mail's default account.
+    let from_clause = match from {
+        Some(f) => format!(
+            r#"  const want = {}.toLowerCase();
+  let acct = null;
+  for (const a of M.accounts()) {{
+    if (String(a.name()).toLowerCase() === want ||
+        (a.emailAddresses().length > 0 &&
+         String(a.emailAddresses()[0]).toLowerCase() === want)) {{
+      acct = a;
+      break;
+    }}
+  }}
+  if (!acct) throw new Error('no matching account for from: ' + {});
+  msg.account = acct;
+"#,
+            js_str(f),
+            js_str(f)
+        ),
+        None => String::new(),
+    };
     format!(
         r#"(() => {{
   const M = Application('Mail');
   const msg = M.OutgoingMessage({{subject: {}, content: {}}}).make();
   msg.to.push(M.ToRecipient({{address: {}}}).make());
-  msg.send();
+{}  msg.send();
   return {{status: 'sent'}};
 }})()"#,
         js_str(subject),
         js_str(body),
         js_str(to),
+        from_clause,
     )
 }
 
@@ -311,5 +663,58 @@ mod tests {
         let s = search_expr("O'Brien \"x\"", Some("work"), None, None, 20, 0);
         assert!(s.contains(r#""o'brien \"x\"""#), "{s}");
         assert!(s.contains(r#"{name: "work"}"#), "{s}");
+    }
+    #[test]
+    fn search_multi_builder_escapes_and_loops_targets() {
+        let s = search_multi_expr(
+            &MailTargets::Folders(vec![
+                ("Wörk \"1\"".into(), "Box\\A".into()),
+                ("B".into(), "C".into()),
+            ]),
+            "O'Brien",
+            Some("2026-08-01T00:00:00Z"),
+            20,
+            40,
+        );
+        // Folder pairs are escaped verbatim (only the query is lowercased).
+        assert!(s.contains(r#"{a: "Wörk \"1\"", b: "Box\\A"}"#), "{s}");
+        assert!(s.contains(r#"label = t.a + '/' + t.b;"#), "{s}");
+        // Budget and per-target scan caps are baked into the script.
+        assert!(s.contains("const BUDGET_MS = 25000;"), "{s}");
+        assert!(s.contains("Math.min(box.messages.length, 1000)"), "{s}");
+        // Query is lowercased then escaped like search_expr.
+        assert!(s.contains(r#""o'brien""#), "{s}");
+
+        let u = search_multi_expr(&MailTargets::Unified, "x", None, 10, 0);
+        assert!(u.contains("const targets = [{u: true}];"), "{u}");
+        assert!(u.contains("'Unified/Inbox'"), "{u}");
+    }
+
+    #[test]
+    fn forward_and_reply_builders_escape_user_text() {
+        let f = forward_expr("42", "boss@x \"cc\"", Some("O'Brien \"note\""));
+        assert!(f.contains(r#""boss@x \"cc\"""#), "{f}");
+        assert!(f.contains(r#""O'Brien \"note\"""#), "{f}");
+        assert!(f.contains(".forward({to:"), "{f}");
+        assert!(f.contains("fw.comment = "), "{f}");
+        assert!(
+            !forward_expr("42", "boss@x", None).contains("comment"),
+            "no comment clause when comment is None"
+        );
+
+        let r = reply_expr("7", "line\nbreak");
+        assert!(r.contains("\"line\\nbreak\""), "{r}");
+        assert!(r.contains(".reply()"), "{r}");
+        assert!(r.contains("rp.content = "), "{r}");
+    }
+
+    #[test]
+    fn send_builder_matches_from_by_name_or_email_only_when_given() {
+        let with = send_expr("mom@x", "Hi", "Hello!", Some("Work"));
+        // Case-insensitive identity match on name or primary email, then
+        // the resolved account is pinned onto the outgoing message.
+        assert!(with.contains(r#"want = "Work".toLowerCase()"#), "{with}");
+        assert!(with.contains("msg.account = acct"), "{with}");
+        assert!(with.contains("emailAddresses"), "{with}");
     }
 }
