@@ -383,6 +383,34 @@ pub fn resolve_selection(
     (pairs, rejected, denied_admitted)
 }
 
+/// Renders the scope universe for error/doctor output: mode plus the FULL
+/// folder list, explicitly counting entries and flagging any display cap.
+/// Rationale: an agent once read a truncated 20-entry list as the complete
+/// scope and excluded most of the user's mailbox from every later search.
+pub fn format_scope_hint(scope: &EffectiveScope) -> String {
+    let mut names: Vec<String> = scope
+        .all()
+        .iter()
+        .map(|(a, m)| format!("{a}/{m}"))
+        .collect();
+    names.sort();
+    const MAX_LISTED: usize = 60;
+    let (shown, more) = if names.len() > MAX_LISTED {
+        (
+            names[..MAX_LISTED].to_vec(),
+            format!(" …+{} more", names.len() - MAX_LISTED),
+        )
+    } else {
+        (names.clone(), String::new())
+    };
+    format!(
+        "scope mode '{}' allows {} folder(s): [{}]{more} — full live list via mail_list_mailboxes",
+        scope.mode(),
+        names.len(),
+        shown.join(", ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,5 +757,29 @@ mod tests {
         assert_eq!(scope.mode(), "open");
         assert!(scope.allows("Any", "Trash"));
         assert!(scope.allows("Any", "Whatever"));
+    }
+
+    // --- format_scope_hint (honest universe in errors/doctor) ---
+
+    #[test]
+    fn scope_hint_lists_everything_with_mode_and_count() {
+        let scope = deny_set_scope();
+        let hint = format_scope_hint(&scope);
+        assert!(hint.contains("mode 'default-deny-set'"), "{hint}");
+        assert!(hint.contains("4 folder(s)"), "{hint}");
+        assert!(hint.contains("Exchange/Apps"), "{hint}");
+        assert!(hint.contains("Google/INBOX"), "{hint}");
+        assert!(!hint.contains("more —"), "no truncation under cap: {hint}");
+    }
+
+    #[test]
+    fn scope_hint_flags_truncation_explicitly() {
+        let live: Vec<(String, Vec<String>)> = (0..70)
+            .map(|i| ("Big".to_string(), vec![format!("Box{i:02}")]))
+            .collect();
+        let (scope, _) = EffectiveScope::validate(&MailPolicy::default(), &live);
+        let hint = format_scope_hint(&scope);
+        assert!(hint.contains("70 folder(s)"), "{hint}");
+        assert!(hint.contains("…+10 more"), "{hint}");
     }
 }

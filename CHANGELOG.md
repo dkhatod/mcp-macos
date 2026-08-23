@@ -3,6 +3,20 @@
 All notable changes. Format follows [Keep a Changelog](https://keepachangelog.com);
 versions are semver (0.x: breaking changes bump minor).
 
+## [0.1.6] — 2026-08-23
+
+### Fixed
+- Scope-rejection errors and `mail_config` no longer show a silently
+  truncated folder list: the previous 20-entry cap led an agent to read
+  the list as the complete scope and exclude most of the mailbox from
+  every later search. Errors now carry mode + full count + complete list
+  (`format_scope_hint`), flagging any display truncation explicitly.
+
+### Added
+- `mail_config` reports `state_dir` and `state_files` so status/history
+  workflows can discover persisted state (e.g. `job-apps.json`) without
+  guessing paths.
+
 ## [0.1.5] — 2026-08-23
 
 ### Added

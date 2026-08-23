@@ -204,12 +204,13 @@ impl MacosServer {
         }
     }
 
-    /// Actionable out-of-scope error for a folder selection, carrying the
-    /// effective allowlist (`EffectiveScope::summary`, capped at 20 entries).
+    /// Scope-rejection error carrying an HONEST picture of the universe
+    /// (mode, full folder list, count). A truncated list here once led an
+    /// agent to conclude most folders were out of scope.
     fn out_of_scope(folder: &str, scope: &policy::EffectiveScope) -> AppleError {
         AppleError::Transport(format!(
-            "folder '{folder}' outside configured scope; valid: {:?}",
-            scope.summary()
+            "folder '{folder}' outside configured scope; {}",
+            policy::format_scope_hint(scope)
         ))
     }
 
@@ -530,15 +531,28 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Read-only doctor for the active Mail scope policy: returns {mode, folders, default_from, deny_set}, where mode is \"open\", \"explicit\" or \"default-deny-set\", folders lists the effective allowlist of Account/Mailbox entries accepted by mail_search, default_from is the fallback send identity and deny_set the mailbox names excluded when no explicit allowlist is configured. No arguments, no side effects.",
+        description = "Read-only doctor for the active Mail scope policy: returns {mode, folders (FULL effective list of Account/Mailbox entries accepted by mail_search — not truncated), default_from, deny_set (mailbox names excluded when no explicit allowlist is configured), state_dir (personai state directory; consult job-apps.json there for status/history tasks), state_files (json files currently in state_dir)}. No arguments, no side effects.",
         annotations(read_only_hint = true)
     )]
     async fn mail_config(&self) -> String {
+        let state_files = std::fs::read_dir(&self.state_dir)
+            .map(|rd| {
+                let mut names: Vec<String> = rd
+                    .flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| n.ends_with(".json") || n.ends_with(".jsonl"))
+                    .collect();
+                names.sort();
+                names
+            })
+            .unwrap_or_default();
         serde_json::json!({
             "mode": self.scope.mode(),
-            "folders": self.scope.summary(),
+            "folders": self.scope.all(),
             "default_from": self.policy.default_from.clone(),
             "deny_set": policy::DEFAULT_DENY,
+            "state_dir": self.state_dir.display().to_string(),
+            "state_files": state_files,
         })
         .to_string()
     }
@@ -703,7 +717,7 @@ impl MacosServer {
 #[tool_handler(
     router = Self::tool_router(),
     name = "mcp-macos",
-    version = "0.1.5",
+    version = "0.1.6",
     instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> mail_search then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
 )]
 impl rmcp::ServerHandler for MacosServer {
