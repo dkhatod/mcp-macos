@@ -12,7 +12,7 @@ struct Fixture {
 fn fixture(envelopes: &[&str]) -> Fixture {
     let mut t = MockTransport::new();
     for e in envelopes {
-        t.enqueue(*e);
+        t.enqueue(e);
     }
     let dir = tempfile::tempdir().unwrap();
     let mut ts = CalendarToolset::new(t);

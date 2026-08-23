@@ -14,7 +14,7 @@ struct Fixture {
 fn fixture(envelopes: &[&str]) -> Fixture {
     let mut t = MockTransport::new();
     for e in envelopes {
-        t.enqueue(*e);
+        t.enqueue(e);
     }
     let dir = tempfile::tempdir().unwrap();
     let mut ts = MailToolset::new(t);
@@ -45,7 +45,7 @@ async fn search_returns_metadata_only_and_paginates() {
     let env = format!(r#"{{"ok":true,"value":{mailbox}}}"#);
     let mut f = fixture(&[&env]);
     let res =
-        f.ts.search("application", None, None, None, Some(2), 0, true)
+        f.ts.search("application", &[], None, None, None, Some(2), 0, 5000, true)
             .await
             .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
@@ -65,11 +65,13 @@ async fn search_escapes_user_text_into_script() {
     let _ =
         f.ts.search(
             "O'Brien \"quoted\" \\path",
+            &[],
             Some("work"),
             None,
             None,
             None,
             0,
+            5000,
             true,
         )
         .await
@@ -179,10 +181,10 @@ async fn real_mail_accounts_search_read() {
         Err(e) => panic!("list_accounts: {e}"),
     };
     let v: serde_json::Value = serde_json::from_str(&accounts).unwrap();
-    assert!(v["accounts"].as_array().unwrap().len() >= 1);
+    assert!(!v["accounts"].as_array().unwrap().is_empty());
 
     let res = ts
-        .search("a", None, None, None, Some(5), 0, true)
+        .search("a", &[], None, None, None, Some(5), 0, 5000, true)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
@@ -228,11 +230,13 @@ async fn search_targets_named_mailbox_when_given() {
     let _ =
         f.ts.search(
             "x",
+            &[],
             Some("Google"),
             Some("Work".into()),
             None,
             None,
             0,
+            5000,
             true,
         )
         .await
@@ -290,10 +294,12 @@ async fn search_multi_merges_folders_paginates_and_strips_bodies() {
                 ("Google".into(), "Inbox".into()),
             ]),
             "invoice",
+            &[],
             None,
             2,
             1,
             None,
+            5000,
             true,
         )
         .await
@@ -325,10 +331,12 @@ async fn search_multi_reports_truncation_passthrough() {
         f.ts.search_multi(
             &MailTargets::Folders(vec![("W".into(), "I".into())]),
             "q",
+            &[],
             None,
             50,
             0,
             None,
+            5000,
             true,
         )
         .await
@@ -348,10 +356,12 @@ async fn search_multi_grouped_mode_passthrough_and_script_flags() {
         f.ts.search_multi(
             &MailTargets::Unified,
             "application",
+            &[],
             None,
             20,
             0,
             Some(MailGroupBy::Sender),
+            5000,
             false,
         )
         .await
@@ -369,6 +379,70 @@ async fn search_multi_grouped_mode_passthrough_and_script_flags() {
     assert!(script.contains("const GROUP = 'sender';"), "{script}");
 }
 
+#[tokio::test]
+async fn search_without_terms_matches_all_and_emits_empty_term_array() {
+    let env = r#"{"ok":true,"value":{"total":1,"results":[{"id":"m1","subject":"anything at all","from":"a@x","date":"2026-08-19T09:00:00Z","snippet":""}]}}"#;
+    let mut f = fixture(&[env]);
+    let res =
+        f.ts.search("", &[], None, None, None, Some(5), 0, 5000, false)
+            .await
+            .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert_eq!(v["total"], 1, "match-all census returns every message");
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(script.contains("const TERMS = []"), "{script}");
+    assert!(!script.contains("qLower"), "legacy single-term path gone");
+}
+
+#[tokio::test]
+async fn any_of_terms_lowercased_into_script_as_or_set() {
+    let mut f = fixture(&[r#"{"ok":true,"value":{"total":0,"results":[]}}"#]);
+    let _ =
+        f.ts.search(
+            "Application",
+            &["Interview's".to_string(), "OFFER".to_string()],
+            None,
+            None,
+            None,
+            None,
+            0,
+            5000,
+            false,
+        )
+        .await
+        .unwrap();
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(
+        script.contains(r#"const TERMS = ["application", "interview's", "offer"]"#),
+        "{script}"
+    );
+}
+
+#[tokio::test]
+async fn scan_limit_reaches_script_in_place_of_default_cap() {
+    let mut f = fixture(&[
+        r#"{"ok":true,"value":{"total":0,"results":[],"scanned_per_folder":{"W/I":12000},"truncated":false}}"#,
+    ]);
+    let _ =
+        f.ts.search_multi(
+            &MailTargets::Folders(vec![("W".into(), "I".into())]),
+            "",
+            &[],
+            None,
+            10,
+            0,
+            None,
+            12_000,
+            false,
+        )
+        .await
+        .unwrap();
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(
+        script.contains(", 12000);"),
+        "scan cap not applied: {script}"
+    );
+}
 #[tokio::test]
 async fn forward_without_gate_refuses() {
     let t = MockTransport::new();

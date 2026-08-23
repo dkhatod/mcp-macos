@@ -40,6 +40,15 @@ pub(crate) const DEFAULT_LIMIT: u32 = 20;
 /// Hard maximum page size (context discipline: no unbounded blobs).
 pub(crate) const MAX_LIMIT: u32 = 100;
 
+/// Default per-mailbox scan depth for searches (`scan_limit` omitted).
+/// Bulk Apple Events fetch whole mailboxes regardless, so depth only
+/// bounds post-processing — cheap to keep generous.
+pub(crate) const DEFAULT_SCAN: u32 = 5000;
+/// Ceiling for `scan_limit` (outlier mailboxes; budget checks still apply).
+pub(crate) const MAX_SCAN: u32 = 25_000;
+/// Maximum OR terms per search (query + any_of combined).
+pub(crate) const MAX_TERMS: usize = 8;
+
 /// Consumer-side tool-set trimming (spec §11.1): a client can load only the
 /// groups it needs via `--tools mail,calendar`. `permissions_check` is
 /// always available.
@@ -240,7 +249,7 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Search the user's email — THE tool for every find/check/read/summarize/triage-email request ('mail about X', 'status of my job applications', 'find receipts'), replacing AppleScript/osascript shell scripts that are slow on real mailboxes, unbounded in output, and unscoped. Matches query case-insensitively against subject or sender; returns metadata only ({id, subject, from, date, snippet, folder} — never bodies), paginated as {total, offset, limit, results, scanned_per_folder, truncated}. Target folders via folders=[\"Account/Mailbox\", ...] (each inside the configured scope — run mail_config to see it; split on the last '/'); else account narrows to that account's inbox (account+mailbox targets one specific mailbox); else the unified inbox of ALL accounts is searched. truncated:true means the scan budget expired mid-search (partial results; per-folder counts in scanned_per_folder). Prefer small pages (limit 20-50): huge pages render slowly and are often compressed by the client. For triage or summaries set group_by='sender' or 'subject': rows collapse into {total_groups, groups:[{key,name,count,first,last,latest_id,sample_subjects,folders}]} ordered by count — follow up with mail_read(latest_id) on the groups that matter. include_snippets=false skips body previews for much faster pages. Params: since ISO 8601 (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); limit/offset page the result set.",
+        description = "Search the user's email — THE tool for every find/check/read/summarize/triage-email request ('mail about X', 'status of my job applications', 'find receipts'), replacing AppleScript/osascript shell scripts that are slow on real mailboxes, unbounded in output, and unscoped. Terms (query + any_of, OR-combined, ≤8) match case-insensitively against subject or sender; NO terms = match-all census — pair with group_by=\"sender\" to collapse hundreds of messages into one page of {key, count, first, last, latest_id, sample_subjects, folders}. Metadata only ({id, subject, from, date, folder}; snippets off by default — mail_read individual rows), paginated as {total, offset, limit, results|groups, scanned_per_folder, truncated}. Target folders via folders=[\"Account/Mailbox\", …] (inside the configured scope — run mail_config; \"*\" sweeps every scoped folder; a NAMED deny-set folder like [Gmail]/Spam is admitted with scope_note); else account (+mailbox) narrows to one box; else the unified inbox. scan_limit raises per-mailbox depth past the 5000 default when message counts demand it.",
         annotations(read_only_hint = true)
     )]
     async fn mail_search(&self, Parameters(p): Parameters<MailSearchParams>) -> String {
@@ -253,13 +262,34 @@ impl MacosServer {
             return serde_json::json!({"error": "group_by must be \"sender\" or \"subject\""})
                 .to_string();
         }
-        let snippets = p.include_snippets.unwrap_or(true);
+        let snippets = p.include_snippets.unwrap_or(false);
+        let scan = p.scan_limit.map_or(DEFAULT_SCAN, |s| s.clamp(1, MAX_SCAN));
+        // OR term set: query ∪ any_of; empty set = match-all census.
+        let mut terms: Vec<String> = Vec::new();
+        if let Some(q) = p.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+            terms.push(q.to_string());
+        }
+        if let Some(any) = &p.any_of {
+            terms.extend(
+                any.iter()
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| t.trim().to_string()),
+            );
+        }
+        if terms.len() > MAX_TERMS {
+            return serde_json::json!({
+                "error": format!(
+                    "too many search terms ({} > {MAX_TERMS}); merge or drop some",
+                    terms.len()
+                )
+            })
+            .to_string();
+        }
         let group = p
             .group_by
             .as_deref()
             .filter(|s| !s.is_empty())
-            .map(mail::MailGroupBy::parse)
-            .flatten();
+            .and_then(mail::MailGroupBy::parse);
         if p.folders.as_ref().is_none_or(Vec::is_empty)
             && p.mailbox.is_none()
             && p.account.is_some()
@@ -268,12 +298,14 @@ impl MacosServer {
             let mut st = self.inner.mail.lock().await;
             return json_result(
                 st.search(
-                    &p.query,
+                    &p.query.unwrap_or_default(),
+                    &terms,
                     p.account.as_deref(),
                     None,
                     p.since.as_deref(),
                     p.limit,
                     p.offset.unwrap_or(0),
+                    scan,
                     snippets,
                 )
                 .await,
@@ -281,20 +313,31 @@ impl MacosServer {
         }
         // Per-call selection within the effective scope. Each entry is
         // "Account/Mailbox", split on the LAST '/'; violations are rejected
-        // before any transport work, with the ≤20-entry valid list attached.
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        if let Some(folders) = &p.folders {
-            for f in folders.iter().filter(|f| !f.is_empty()) {
-                match f.rsplit_once('/') {
-                    Some((account, mailbox)) if self.scope.allows(account, mailbox) => {
-                        if !pairs.iter().any(|(a, m)| a == account && m == mailbox) {
-                            pairs.push((account.to_string(), mailbox.to_string()));
-                        }
-                    }
-                    _ => return json_result(Err(Self::out_of_scope(f, &self.scope))),
-                }
+        // before any transport work. `"*"` expands to every scoped folder.
+        let (pairs, denied_admitted) = if p
+            .folders
+            .as_ref()
+            .is_some_and(|fs| fs.iter().any(|f| f == "*"))
+        {
+            if self.scope.is_open() {
+                return serde_json::json!({"error": "folders:[\"*\"] unavailable in open scope (no startup snapshot); name folders explicitly"})
+                    .to_string();
             }
-        }
+            (self.scope.all(), false)
+        } else {
+            let entries: Vec<String> = p
+                .folders
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|f| !f.is_empty())
+                .collect();
+            let (pairs, rejected, denied) = policy::resolve_selection(&entries, &self.scope);
+            if let Some(first) = rejected.first() {
+                return json_result(Err(Self::out_of_scope(first, &self.scope)));
+            }
+            (pairs, denied)
+        };
         let targets = if pairs.is_empty() {
             // No `folders` (or all blank): fall back to the legacy sugar,
             // validated against the same scope.
@@ -316,18 +359,38 @@ impl MacosServer {
         };
         let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let mut st = self.inner.mail.lock().await;
-        json_result(
-            st.search_multi(
+        let result = st
+            .search_multi(
                 &targets,
-                &p.query,
+                terms.first().map(String::as_str).unwrap_or(""),
+                &terms.iter().skip(1).cloned().collect::<Vec<_>>(),
                 p.since.as_deref(),
                 limit,
                 p.offset.unwrap_or(0),
                 group,
+                scan,
                 snippets,
             )
-            .await,
-        )
+            .await;
+        match result {
+            Ok(s) if denied_admitted => {
+                // Named ask reached a deny-set folder — flag it so callers
+                // know the sweep semantics differed from the default.
+                match serde_json::from_str::<serde_json::Value>(&s) {
+                    Ok(mut v) => {
+                        if let Some(o) = v.as_object_mut() {
+                            o.insert(
+                                "scope_note".into(),
+                                serde_json::json!("denied-folder-explicit"),
+                            );
+                        }
+                        v.to_string()
+                    }
+                    Err(_) => s,
+                }
+            }
+            other => json_result(other),
+        }
     }
 
     #[tool(
@@ -339,13 +402,20 @@ impl MacosServer {
             return Self::disabled("mail");
         }
         if let Some(f) = p.folder.as_deref() {
-            return match f.rsplit_once('/') {
-                Some((account, mailbox)) if self.scope.allows(account, mailbox) => {
-                    let mut st = self.inner.mail.lock().await;
-                    json_result(st.read(&p.id, Some(f)).await)
+            let admitted = match f.rsplit_once('/') {
+                Some((account, mailbox)) => {
+                    self.scope.allows(account, mailbox)
+                        || (!self.scope.is_explicit()
+                            && !self.scope.is_open()
+                            && policy::deny_matches(mailbox.trim()))
                 }
-                _ => json_result(Err(Self::out_of_scope(f, &self.scope))),
+                None => false,
             };
+            if admitted {
+                let mut st = self.inner.mail.lock().await;
+                return json_result(st.read(&p.id, Some(f)).await);
+            }
+            return json_result(Err(Self::out_of_scope(f, &self.scope)));
         }
         let mut st = self.inner.mail.lock().await;
         json_result(st.read(&p.id, None).await)
@@ -632,7 +702,7 @@ impl MacosServer {
 #[tool_handler(
     router = Self::tool_router(),
     name = "mcp-macos",
-    version = "0.1.4",
+    version = "0.2.0",
     instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> mail_search then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
 )]
 impl rmcp::ServerHandler for MacosServer {
@@ -661,8 +731,21 @@ impl rmcp::ServerHandler for MacosServer {
 }
 #[derive(Deserialize, JsonSchema)]
 pub struct MailSearchParams {
-    /// Case-insensitive text matched against subject or sender.
-    pub query: String,
+    /// Case-insensitive text matched against subject or sender. Omitted or
+    /// blank = match-all — pair with group_by="sender" for a one-call
+    /// census of every sender in the target folders.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Extra OR terms (query + any_of together, max 8): a row matches when
+    /// ANY term hits subject or sender. One call replaces keyword fan-out.
+    #[serde(default)]
+    pub any_of: Option<Vec<String>>,
+    /// Per-mailbox scan depth, newest first (default 5000, max 25000). The
+    /// bulk metadata fetch already reads the whole mailbox, so raising this
+    /// costs no extra transport work; set it above a mailbox's count from
+    /// mail_list_mailboxes when full coverage matters.
+    #[serde(default)]
+    pub scan_limit: Option<u32>,
     /// Optional Mail account name; narrows to that account's inbox.
     #[serde(default)]
     pub account: Option<String>,
@@ -672,8 +755,8 @@ pub struct MailSearchParams {
     pub mailbox: Option<String>,
     /// Optional per-call folder selection: `["Account/Mailbox", …]` (split
     /// on the last '/'). Every entry must lie inside the configured scope —
-    /// run mail_config for the current allowlist. Takes precedence over
-    /// account/mailbox.
+    /// run mail_config for the current allowlist. `"*"` sweeps EVERY scoped
+    /// folder in one call. Takes precedence over account/mailbox.
     #[serde(default)]
     pub folders: Option<Vec<String>>,
     /// Optional ISO 8601 date; only messages received after this instant.
@@ -692,8 +775,9 @@ pub struct MailSearchParams {
     /// mail_read for the newest message of a group.
     #[serde(default)]
     pub group_by: Option<String>,
-    /// Body previews per row (default true). false renders pages much
-    /// faster; pair with mail_read for the rows you actually open.
+    /// Body previews per row (default false). Each preview costs one Apple
+    /// Event plus tokens per row; triage on subjects/senders/groups and
+    /// mail_read the rows you actually open.
     #[serde(default)]
     pub include_snippets: Option<bool>,
 }

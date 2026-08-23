@@ -153,28 +153,36 @@ impl<T: AppleTransport> MailToolset<T> {
         Ok(v.to_string())
     }
 
-    /// Searches Mail metadata. Returns `{total, offset, limit, results}`
-    /// where each result carries `id, subject, from, date, snippet` and
-    /// NEVER a body.
+    /// Searches Mail metadata. `query` + `any_of` form the OR term set
+    /// (both empty = match-all census). Returns
+    /// `{total, offset, limit, results}` where each result carries
+    /// `id, subject, from, date, snippet` and NEVER a body.
+    // Argument lists mirror the mail_search wire params one-to-one; a
+    // params struct would only rename positions.
+    #[allow(clippy::too_many_arguments)]
     pub async fn search(
         &mut self,
         query: &str,
+        any_of: &[String],
         account: Option<&str>,
         mailbox: Option<String>,
         since: Option<&str>,
         limit: Option<u32>,
         offset: u32,
+        scan: u32,
         snippets: bool,
     ) -> Result<String, AppleError> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let v = self
             .run_search_json(&search_expr(
                 query,
+                any_of,
                 account,
                 mailbox.as_deref(),
                 since,
                 limit,
                 offset,
+                scan,
                 snippets,
             ))
             .await?;
@@ -216,19 +224,22 @@ impl<T: AppleTransport> MailToolset<T> {
     /// last, latest_id, sample_subjects, folders`. Metadata only — never
     /// bodies; `snippets = false` skips per-row body previews entirely
     /// (they cost one Apple Event each).
+    #[allow(clippy::too_many_arguments)]
     pub async fn search_multi(
         &mut self,
         targets: &MailTargets,
         query: &str,
+        any_of: &[String],
         since: Option<&str>,
         limit: u32,
         offset: u32,
         group: Option<MailGroupBy>,
+        scan: u32,
         snippets: bool,
     ) -> Result<String, AppleError> {
         let v = self
             .run_search_json(&search_multi_expr(
-                targets, query, since, limit, offset, group, snippets,
+                targets, query, any_of, since, limit, offset, group, scan, snippets,
             ))
             .await?;
 
@@ -378,11 +389,28 @@ impl<T: AppleTransport> MailToolset<T> {
 // Each builder returns a single JS *expression* (an arrow IIFE) embedded by
 // `wrap_jxa`. User text enters only through `js_str`.
 
-/// Scans the newest [`SCAN_MAX`] messages of the target mailbox with four
-/// bulk Apple Events, filters in JS, pages the matches. Individual access
-/// through a `whose(...)` specifier re-evaluates the whole query per item
-/// and times out on real mailboxes.
-const SCAN_MAX: u32 = 1000;
+/// Emits the lowercased OR-term array shared by both search builders.
+/// Empty array = match-all (census) mode; every message matches.
+fn terms_js(query: &str, any_of: &[String]) -> String {
+    let mut terms: Vec<String> = Vec::with_capacity(any_of.len() + 1);
+    if !query.is_empty() {
+        terms.push(query.to_lowercase());
+    }
+    terms.extend(
+        any_of
+            .iter()
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_lowercase()),
+    );
+    format!(
+        "[{}]",
+        terms
+            .iter()
+            .map(|t| js_str(t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
 
 /// Wall-clock budget for searches, checked between [`MailTargets`] AND
 /// inside the page-rendering loop; expiry yields a partial result with
@@ -422,17 +450,19 @@ impl<T: AppleTransport> MailToolset<T> {
         }
     }
 }
-
+#[allow(clippy::too_many_arguments)]
 fn search_expr(
     query: &str,
+    any_of: &[String],
     account: Option<&str>,
     mailbox: Option<&str>,
     since: Option<&str>,
     limit: u32,
     offset: u32,
+    scan: u32,
     snippets: bool,
 ) -> String {
-    let q = js_str(&query.to_lowercase());
+    let terms_js = terms_js(query, any_of);
     // Default: the unified inbox (all accounts). `account` narrows to that
     // account's inbox; `mailbox` targets a named mailbox inside `account`
     // (Gmail labels live there, outside the inbox).
@@ -467,17 +497,18 @@ fn search_expr(
   const BUDGET_MS = {GLOBAL_BUDGET_MS};
   const t0 = Date.now();
   let timedOut = false;
-  const scan = Math.min(box.messages.length, {SCAN_MAX});
+  const scan = Math.min(box.messages.length, {scan});
   const ids = box.messages.id().slice(0, scan);
   const subjects = box.messages.subject().slice(0, scan);
   const senders = box.messages.sender().slice(0, scan);
   const dates = box.messages.dateReceived().slice(0, scan);
-  const qLower = {q};
+  const TERMS = {terms_js};
   const idx = [];
   for (let i = 0; i < ids.length; i++) {{
     if (sinceMs !== null && (!dates[i] || dates[i].getTime() < sinceMs)) continue;
-    if ((subjects[i] && subjects[i].toLowerCase().includes(qLower)) ||
-        (senders[i] && senders[i].toLowerCase().includes(qLower))) idx.push(i);
+    if (TERMS.length === 0 || TERMS.some(t =>
+        (subjects[i] && subjects[i].toLowerCase().includes(t)) ||
+        (senders[i] && senders[i].toLowerCase().includes(t)))) idx.push(i);
   }}
   const total = idx.length;
   const end = Math.min({offset} + {limit}, total);
@@ -502,22 +533,25 @@ fn search_expr(
 }
 
 /// One script across ALL [`MailTargets`]: per target four bulk Apple
-/// Events sliced to [`SCAN_MAX`], JS filtering identical to
+/// Events sliced to the per-call scan depth, JS filtering identical to
 /// [`search_expr`], a `"Account/Mailbox"` folder tag per hit, a global
 /// date-descending merge, pagination, and the [`GLOBAL_BUDGET_MS`] check
 /// between targets. Unified mode scans the unified inbox under the tag
 /// `Unified/Inbox` (per-message account attribution would cost one event
 /// per message).
+#[allow(clippy::too_many_arguments)]
 fn search_multi_expr(
     targets: &MailTargets,
     query: &str,
+    any_of: &[String],
     since: Option<&str>,
     limit: u32,
     offset: u32,
     group: Option<MailGroupBy>,
+    scan: u32,
     snippets: bool,
 ) -> String {
-    let q = js_str(&query.to_lowercase());
+    let terms_js = terms_js(query, any_of);
     let since_clause = match since {
         Some(iso) => format!("const sinceMs = Date.parse({});", js_str(iso)),
         None => "const sinceMs = null;".to_string(),
@@ -545,7 +579,7 @@ fn search_multi_expr(
   const GROUP = {group_js};
   const SNIPPETS = {snippets};
   {since_clause}
-  const qLower = {q};
+  const TERMS = {terms_js};
   const targets = {targets_js};
   const merged = [];
   const scannedPerFolder = {{}};
@@ -562,7 +596,7 @@ fn search_multi_expr(
         box = M.accounts.whose({{name: t.a}})()[0].mailboxes.whose({{name: t.b}})()[0];
       }}
     }} catch (e) {{ continue; }}
-    const scan = Math.min(box.messages.length, {SCAN_MAX});
+    const scan = Math.min(box.messages.length, {scan});
     scannedPerFolder[label] = scan;
     const ids = box.messages.id().slice(0, scan);
     const subjects = box.messages.subject().slice(0, scan);
@@ -570,8 +604,9 @@ fn search_multi_expr(
     const dates = box.messages.dateReceived().slice(0, scan);
     for (let i = 0; i < ids.length; i++) {{
       if (sinceMs !== null && (!dates[i] || dates[i].getTime() < sinceMs)) continue;
-      if ((subjects[i] && subjects[i].toLowerCase().includes(qLower)) ||
-          (senders[i] && senders[i].toLowerCase().includes(qLower))) {{
+      if (TERMS.length === 0 || TERMS.some(t =>
+          (subjects[i] && subjects[i].toLowerCase().includes(t)) ||
+          (senders[i] && senders[i].toLowerCase().includes(t)))) {{
         merged.push({{
           id: String(ids[i]),
           subject: subjects[i],
@@ -867,7 +902,17 @@ mod tests {
 
     #[test]
     fn search_builder_escapes_user_text() {
-        let s = search_expr("O'Brien \"x\"", Some("work"), None, None, 20, 0, true);
+        let s = search_expr(
+            "O'Brien \"x\"",
+            &[],
+            Some("work"),
+            None,
+            None,
+            20,
+            0,
+            5000,
+            true,
+        );
         assert!(s.contains(r#""o'brien \"x\"""#), "{s}");
         assert!(s.contains(r#"{name: "work"}"#), "{s}");
     }
@@ -879,22 +924,34 @@ mod tests {
                 ("B".into(), "C".into()),
             ]),
             "O'Brien",
+            &[],
             Some("2026-08-01T00:00:00Z"),
             20,
             40,
             None,
+            1000,
             true,
         );
-        // Folder pairs are escaped verbatim (only the query is lowercased).
+        // Folder pairs are escaped verbatim (only the terms are lowercased).
         assert!(s.contains(r#"{a: "Wörk \"1\"", b: "Box\\A"}"#), "{s}");
         assert!(s.contains(r#"label = t.a + '/' + t.b;"#), "{s}");
         // Budget and per-target scan caps are baked into the script.
         assert!(s.contains("const BUDGET_MS = 25000;"), "{s}");
         assert!(s.contains("Math.min(box.messages.length, 1000)"), "{s}");
-        // Query is lowercased then escaped like search_expr.
-        assert!(s.contains(r#""o'brien""#), "{s}");
+        // Terms are lowercased then escaped like search_expr.
+        assert!(s.contains(r#"["o'brien"]"#), "{s}");
 
-        let u = search_multi_expr(&MailTargets::Unified, "x", None, 10, 0, None, true);
+        let u = search_multi_expr(
+            &MailTargets::Unified,
+            "x",
+            &[],
+            None,
+            10,
+            0,
+            None,
+            5000,
+            true,
+        );
         assert!(u.contains("const targets = [{u: true}];"), "{u}");
         assert!(u.contains("'Unified/Inbox'"), "{u}");
     }

@@ -3,6 +3,34 @@
 All notable changes. Format follows [Keep a Changelog](https://keepachangelog.com);
 versions are semver (0.x: breaking changes bump minor).
 
+## [0.2.0] — 2026-08-23
+
+### Added
+- Match-all census: `query` is now optional — omitting it (with
+  `group_by="sender"`) returns a per-sender census of the target folders in
+  one call (`key, count, first, last, latest_id, sample_subjects,
+  folders`).
+- OR terms: new `any_of` parameter (≤8 terms combined with `query`) matches
+  a row when ANY term hits subject or sender, replacing per-keyword
+  fan-out.
+- Deep scan: `scan_limit` raises the per-mailbox scan depth past the new
+  5000 default (max 25 000). The bulk metadata fetch already reads whole
+  mailboxes, so depth bounds only post-processing.
+- Whole-scope sweep: `folders: ["*"]` expands to every scoped folder for a
+  single-call corpus pass under the existing wall-clock budget.
+- Named deny-set folders (e.g. `[Gmail]/Spam`, `Trash`) are admitted to
+  `mail_search`/`mail_read` when explicitly requested in default-deny-set
+  mode; responses carry `scope_note: "denied-folder-explicit"`. Explicit
+  allowlists stay strict; sweeps still exclude denied names.
+
+### Changed
+- `include_snippets` now defaults to **false**: previews cost one Apple
+  Event and one token blob per row; triage on metadata and `mail_read`
+  specific rows instead.
+- Default scan depth raised from 1000 to 5000 messages per mailbox
+  (`SCAN_DEFAULT`), covering real-world deep inboxes without per-call
+  tuning.
+
 ## [0.1.4] — 2026-08-23
 
 ### Added

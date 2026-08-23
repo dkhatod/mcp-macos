@@ -12,7 +12,7 @@ struct Fixture {
 fn fixture(envelopes: &[&str]) -> Fixture {
     let mut t = MockTransport::new();
     for e in envelopes {
-        t.enqueue(*e);
+        t.enqueue(e);
     }
     let dir = tempfile::tempdir().unwrap();
     let mut ts = MessagesToolset::new(t);
@@ -29,7 +29,7 @@ async fn read_is_paginated_metadata() {
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     assert_eq!(v["total"], 5);
     assert_eq!(v["offset"], 0);
-    assert!(v["messages"].as_array().unwrap().len() >= 1);
+    assert!(!v["messages"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

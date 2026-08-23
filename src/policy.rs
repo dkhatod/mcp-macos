@@ -295,6 +295,25 @@ impl EffectiveScope {
             .map(|f| format!("{}/{}", f.account, f.mailbox))
             .collect()
     }
+
+    /// Every validated entry, uncapped and machine-readable. Drives the
+    /// `folders: ["*"]` whole-scope sweep.
+    pub fn all(&self) -> Vec<(String, String)> {
+        self.entries
+            .iter()
+            .map(|f| (f.account.clone(), f.mailbox.clone()))
+            .collect()
+    }
+
+    /// Whether the session runs under a user-configured allowlist.
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+
+    /// Whether scope resolution degraded to allow-everything.
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
 }
 
 /// Case-insensitive lookup of `account`/`mailbox` in the live snapshot,
@@ -315,6 +334,53 @@ fn find_live<'a>(
         }
     }
     None
+}
+
+/// Resolves per-call `folders` entries against the effective scope.
+///
+/// Returns `(accepted_pairs, rejected_entries, denied_admitted)` where
+/// accepted pairs are deduped (case-insensitively — Mail's `whose` name
+/// match is case-insensitive too) `"Account/Mailbox"` selections, and
+/// `denied_admitted` marks that at least one entry reached a deny-set
+/// mailbox via the explicit-request override (default-deny-set mode only —
+/// a named ask like `[Gmail]/Spam` may read spam; sweeps still cannot).
+///
+/// Scope contract note: in default-deny-set mode `allows` filters by
+/// deny-set name only — it does not know whether an account/mailbox exists.
+/// Unknown-but-not-denied names pass through here and degrade gracefully
+/// at the transport layer (the JXA target lookup skips missing folders).
+pub fn resolve_selection(
+    entries: &[String],
+    scope: &EffectiveScope,
+) -> (Vec<(String, String)>, Vec<String>, bool) {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    let mut denied_admitted = false;
+    let push = |pairs: &mut Vec<(String, String)>, account: &str, mailbox: &str| {
+        if !pairs
+            .iter()
+            .any(|(a, m)| a.eq_ignore_ascii_case(account) && m.eq_ignore_ascii_case(mailbox))
+        {
+            pairs.push((account.to_string(), mailbox.to_string()));
+        }
+    };
+    for e in entries {
+        let Some((account, mailbox)) = e.rsplit_once('/') else {
+            rejected.push(e.clone());
+            continue;
+        };
+        if scope.allows(account, mailbox) {
+            push(&mut pairs, account, mailbox);
+            continue;
+        }
+        if !scope.is_explicit() && !scope.is_open() && deny_matches(mailbox.trim()) {
+            push(&mut pairs, account, mailbox);
+            denied_admitted = true;
+            continue;
+        }
+        rejected.push(e.clone());
+    }
+    (pairs, rejected, denied_admitted)
 }
 
 #[cfg(test)]
@@ -401,6 +467,105 @@ mod tests {
         let (policy, _) = MailPolicy::load(None, Some("cli@x"), &path);
         assert_eq!(policy.folders.unwrap()[0].account, "File");
         assert_eq!(policy.default_from.as_deref(), Some("cli@x"));
+    }
+
+    // --- resolve_selection (per-call folders vs scope) ---
+
+    fn deny_set_scope() -> EffectiveScope {
+        let live = vec![
+            (
+                "Google".to_string(),
+                vec!["INBOX".to_string(), "Work".to_string()],
+            ),
+            (
+                "Exchange".to_string(),
+                vec!["Apps".to_string(), "Junk Email".to_string()],
+            ),
+        ];
+        let (scope, _) = EffectiveScope::validate(&MailPolicy::default(), &live);
+        scope
+    }
+
+    #[test]
+    fn resolve_scopes_malformed_and_passes_unknown_accounts() {
+        let scope = deny_set_scope();
+        let entries = vec![
+            "Google/INBOX".to_string(),
+            "NoSlash".to_string(),
+            "Nope/Box".to_string(),
+        ];
+        let (pairs, rejected, denied) = resolve_selection(&entries, &scope);
+        // Unknown-but-not-denied accounts are not this function's job to
+        // reject: transport-side lookup skips missing folders gracefully.
+        assert_eq!(
+            pairs,
+            vec![
+                ("Google".to_string(), "INBOX".to_string()),
+                ("Nope".to_string(), "Box".to_string())
+            ]
+        );
+        assert_eq!(rejected, vec!["NoSlash"]);
+        assert!(!denied);
+    }
+
+    #[test]
+    fn resolve_admits_named_denied_folder_with_flag() {
+        let scope = deny_set_scope();
+        // "Spam" is a deny-set name: a named explicit ask is admitted even
+        // though sweeps exclude it (denied_admitted flags the override).
+        let entries = vec!["Google/Spam".to_string()];
+        let (pairs, rejected, denied) = resolve_selection(&entries, &scope);
+        assert!(rejected.is_empty());
+        assert!(denied);
+        assert_eq!(pairs, vec![("Google".to_string(), "Spam".to_string())]);
+
+        // "Junk Email" is NOT a deny-set name ("Junk" ≠ "Junk Email"):
+        // ordinary scoped selection, no override flag.
+        let entries = vec!["Exchange/Junk Email".to_string()];
+        let (pairs, rejected, denied) = resolve_selection(&entries, &scope);
+        assert!(rejected.is_empty());
+        assert!(!denied);
+        assert_eq!(
+            pairs,
+            vec![("Exchange".to_string(), "Junk Email".to_string())]
+        );
+    }
+    #[test]
+    fn explicit_allowlist_mode_stays_strict_on_denied_names() {
+        let live = vec![(
+            "Google".to_string(),
+            vec!["INBOX".to_string(), "Work".to_string()],
+        )];
+        let policy = MailPolicy {
+            folders: Some(vec![FolderId {
+                account: "Google".into(),
+                mailbox: "INBOX".into(),
+            }]),
+            ..MailPolicy::default()
+        };
+        let (scope, warnings) = EffectiveScope::validate(&policy, &live);
+        assert!(warnings.is_empty());
+        assert!(scope.is_explicit());
+
+        // Even a deny-set name is rejected under an explicit allowlist:
+        // the user's configured list is law.
+        let entries = vec!["Google/INBOX".to_string(), "Google/Spam".to_string()];
+        let (pairs, rejected, denied) = resolve_selection(&entries, &scope);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(rejected, vec!["Google/Spam"]);
+        assert!(!denied);
+    }
+
+    #[test]
+    fn resolve_dedupes_repeated_entries() {
+        let scope = deny_set_scope();
+        let entries = vec![
+            "Google/INBOX".to_string(),
+            "google/inbox".to_string(),
+            "Google/INBOX".to_string(),
+        ];
+        let (pairs, _, _) = resolve_selection(&entries, &scope);
+        assert_eq!(pairs.len(), 1);
     }
 
     #[test]
