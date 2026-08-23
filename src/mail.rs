@@ -593,7 +593,14 @@ fn search_multi_expr(
         label = 'Unified/Inbox';
       }} else {{
         label = t.a + '/' + t.b;
-        box = M.accounts.whose({{name: t.a}})()[0].mailboxes.whose({{name: t.b}})()[0];
+        // Resolve both specifiers to ARRAYS first: a stale account/mailbox
+        // name yields an empty match, and indexing [0] on it would hand a
+        // undefined `box` past this guard and kill the whole sweep with
+        // AppleEvent -1728 on the first property fetch.
+        const accs = M.accounts.whose({{name: t.a}})();
+        const boxes = accs.length ? accs[0].mailboxes.whose({{name: t.b}})() : [];
+        if (!boxes.length) continue;
+        box = boxes[0];
       }}
     }} catch (e) {{ continue; }}
     const scan = Math.min(box.messages.length, {scan});
