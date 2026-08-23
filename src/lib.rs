@@ -202,7 +202,7 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Search Mail metadata (id, subject, from, date, snippet — never bodies), paginated as {total, offset, limit, results}. By default searches the unified inbox of ALL accounts; pass account to narrow to one account's inbox, or account+mailbox for a specific mailbox (use mail_list_mailboxes to discover them). Use mail_read for full content.",
+        description = "Search Mail metadata (id, subject, from, date, snippet — never bodies), paginated as {total, offset, limit, results}. By default searches the unified inbox of ALL accounts; pass account to narrow to one account's inbox, or account+mailbox for a specific mailbox (use mail_list_mailboxes to discover them). Use mail_read for full content. Params: since=ISO 8601 (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); account/mailbox are exact name matches (use mail_list_mailboxes). Example: mail_search(query=\"interview\", since=\"2026-08-23\").",
         annotations(read_only_hint = true)
     )]
     async fn mail_search(&self, Parameters(p): Parameters<MailSearchParams>) -> String {
@@ -318,7 +318,7 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Read events with start date in [start, end) (ISO 8601). Returns {total, offset, limit, events:[{id, title, start, end, calendar}]}.",
+        description = "Read events with start date in [start, end) (ISO 8601). Returns {total, offset, limit, events:[{id, title, start, end, calendar}]}. start inclusive, end exclusive; both ISO 8601. Example: calendar_read(start=\"2026-08-23\", end=\"2026-08-24\").",
         annotations(read_only_hint = true)
     )]
     async fn calendar_read(&self, Parameters(p): Parameters<CalendarReadParams>) -> String {
@@ -334,7 +334,7 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Create a calendar event (first calendar). Soft-gated: re-invoke with confirmation_token to execute. Tokens are single-use, 5-minute TTL.",
+        description = "Create a calendar event (first calendar). Soft-gated: first call returns requires_confirmation + confirmation_token and does NOT create; re-invoke with the token. Tokens single-use, 5-minute TTL. Example: calendar_create(title=\"Interview\", start=\"2026-08-25T09:00:00Z\", end=\"2026-08-25T10:00:00Z\").",
         annotations(destructive_hint = true)
     )]
     async fn calendar_create(&self, Parameters(p): Parameters<CalendarCreateParams>) -> String {
@@ -350,7 +350,7 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Update an event by id (uid from calendar_read); only provided fields change. Soft-gated.",
+        description = "Update an event by id (uid from calendar_read); only provided fields change. Soft-gated: first call returns requires_confirmation + confirmation_token and does NOT modify; re-invoke with the token (single-use, 5-min TTL). Example: calendar_update(id=\"abc\", start=\"2026-08-25T10:00:00Z\").",
         annotations(destructive_hint = true)
     )]
     async fn calendar_update(&self, Parameters(p): Parameters<CalendarUpdateParams>) -> String {
@@ -423,7 +423,8 @@ impl MacosServer {
 #[tool_handler(
     router = Self::tool_router(),
     name = "mcp-macos",
-    version = "0.1.0"
+    version = "0.1.2",
+    instructions = "Purpose-built Mail/Messages/Calendar/Notifications/Clipboard tools; prefer them over raw osascript/AppleScript. List/search results are summary-first metadata + snippet, never bodies — fetch full content by id with mail_read/messages_read. Paginated `offset`+`limit` (default 20, max 100). Sends and calendar writes are soft-gated: first call returns `requires_confirmation` + a single-use confirmation_token (5-min TTL); re-invoke with the token to execute. Reads, notifications, and clipboard are ungated. On permission errors, run `permissions_check` first. For status/history, consult the personai state directory before querying these apps."
 )]
 impl rmcp::ServerHandler for MacosServer {
     async fn list_tools(

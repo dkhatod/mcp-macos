@@ -3,6 +3,20 @@
 All notable changes. Format follows [Keep a Changelog](https://keepachangelog.com);
 versions are semver (0.x: breaking changes bump minor).
 
+## [0.1.2] — 2026-08-23
+
+### Added
+- Server-level `instructions` on the `initialize` response: routes clients to
+  the purpose-built tools over raw AppleScript, documents pagination (default
+  20 / max 100), the soft-gate confirmation-token flow for sends and calendar
+  writes, the ungated reads/notifications/clipboard tier, and the
+  `permissions_check` first-on-error rule.
+
+### Changed
+- Tightened per-tool `description` strings (`mail_search`, `calendar_read`,
+  `calendar_create`, `calendar_update`) to surface ISO 8601 parameter formats,
+  the confirmation-token gate flow, and example invocations.
+
 ## [0.1.0] — 2026-08-22
 
 First release. One stdio binary exposing 14 tools across five Apple apps,
