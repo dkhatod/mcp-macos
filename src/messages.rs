@@ -58,6 +58,14 @@ impl<T: AppleTransport> MessagesToolset<T> {
         Ok(v.to_string())
     }
 
+    /// Lists chats (identifier, display name, service, sample handle,
+    /// message count, last activity), most recent first. Auto-tier.
+    pub async fn chats(&mut self, limit: Option<u32>, offset: u32) -> Result<String, AppleError> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        let v = run_jxa_json(&mut self.transport, &chats_expr(limit, offset)).await?;
+        Ok(v.to_string())
+    }
+
     /// Sends an iMessage/SMS. Soft-gated like [`crate::mail::MailToolset::send`].
     pub async fn send(
         &mut self,
@@ -100,10 +108,11 @@ fn sql_str(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// Builds the two full `sqlite3` shell commands in Rust (count + page), so
-/// the JXA layer receives opaque ready-made commands instead of assembling
-/// SQL through three layers of quoting. Newlines are stripped from text in
-/// SQL because sqlite3 emits one line per row.
+/// Builds ONE `sqlite3` command emitting a `TOTAL` header line followed by
+/// the paged rows, so count and page are consistent by construction (the
+/// previous two-command version reported the global DB size and could
+/// disagree with the page). Newlines are stripped from text in SQL because
+/// sqlite3 emits one line per row.
 fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
     let db = "$HOME/Library/Messages/chat.db";
     let chat_filter = match chat {
@@ -115,40 +124,74 @@ fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
         ),
         None => String::new(),
     };
-    let select = |extra: &str| {
-        format!(
-            "SELECT COALESCE(CASE WHEN m.is_from_me=1 THEN 'me' ELSE h.id END,'unknown'),\
-             CASE WHEN m.is_from_me=1 THEN 'out' ELSE 'in' END,\
-             REPLACE(REPLACE(COALESCE(m.text,''),char(13),' '),char(10),' '),\
-             datetime(m.date/1000000000+978307200,'unixepoch') \
-             FROM message m \
+    let from_join = "FROM message m \
              LEFT JOIN handle h ON h.ROWID=m.handle_id \
              LEFT JOIN chat_message_join cmj ON cmj.message_id=m.ROWID \
-             LEFT JOIN chat c ON c.ROWID=cmj.chat_id \
-             WHERE 1=1{extra} ORDER BY m.date DESC"
-        )
-    };
-    let count_cmd = format!(
-        "sqlite3 {db} \"SELECT COUNT(*) FROM message m LEFT JOIN handle h ON h.ROWID=m.handle_id LEFT JOIN chat_message_join cmj ON cmj.message_id=m.ROWID LEFT JOIN chat c ON c.ROWID=cmj.chat_id WHERE 1=1{chat_filter}\""
-    );
-    let rows_cmd = format!(
-        "sqlite3 -separator '|||' {db} \"{} LIMIT {limit} OFFSET {offset}\"",
-        select(&chat_filter)
+             LEFT JOIN chat c ON c.ROWID=cmj.chat_id";
+    let cmd = format!(
+        "sqlite3 -separator '|||' {db} \"\
+         SELECT COUNT(*) {from_join} WHERE 1=1{chat_filter}; \
+         SELECT COALESCE(CASE WHEN m.is_from_me=1 THEN 'me' ELSE h.id END,'unknown'),\
+         CASE WHEN m.is_from_me=1 THEN 'out' ELSE 'in' END,\
+         REPLACE(REPLACE(COALESCE(m.text,''),char(13),' '),char(10),' '),\
+         datetime(m.date/1000000000+978307200,'unixepoch') \
+         {from_join} WHERE 1=1{chat_filter} ORDER BY m.date DESC \
+         LIMIT {limit} OFFSET {offset};\""
     );
     format!(
         r#"(() => {{
   const app = Application.currentApplication();
   app.includeStandardAdditions = true;
-  const total = Number(app.doShellScript({}));
-  const rows = app.doShellScript({});
-  const messages = rows.length === 0 ? [] : rows.split('\n').map(line => {{
+  const out = String(app.doShellScript({}));
+  const lines = out.length === 0 ? [] : out.split('\n');
+  const total = Number(lines[0]) || 0;
+  const messages = lines.slice(1).map(line => {{
     const [from, direction, text, date] = line.split('|||');
     return {{from: from, direction: direction, text: text || '', date: date}};
   }});
   return {{total: total, offset: {}, limit: {}, messages: messages}};
 }})()"#,
-        js_str(&count_cmd),
-        js_str(&rows_cmd),
+        js_str(&cmd),
+        offset,
+        limit,
+    )
+}
+
+/// Chat discovery: identifier, display name, service, a sample participant
+/// handle, message count, and last activity — recency-ordered, paginated.
+/// This is how agents resolve "send to NAME" without guessing handles.
+fn chats_expr(limit: u32, offset: u32) -> String {
+    let db = "$HOME/Library/Messages/chat.db";
+    let cmd = format!(
+        "sqlite3 -separator '|||' {db} \"\
+         SELECT COUNT(*) FROM chat; \
+         SELECT COALESCE(NULLIF(c.chat_identifier,''),'unknown'),\
+         COALESCE(c.display_name,''),COALESCE(c.service_name,''),\
+         COALESCE((SELECT h.id FROM handle h JOIN chat_handle_join chj \
+           ON chj.handle_id=h.ROWID WHERE chj.chat_id=c.ROWID LIMIT 1),''),\
+         (SELECT COUNT(*) FROM chat_message_join cmj2 WHERE cmj2.chat_id=c.ROWID),\
+         datetime(COALESCE(MAX(cmj3.message_date),0)/1000000000+978307200,'unixepoch') \
+         FROM chat c \
+         LEFT JOIN chat_message_join cmj3 ON cmj3.chat_id=c.ROWID \
+         GROUP BY c.ROWID ORDER BY MAX(cmj3.message_date) DESC \
+         LIMIT {limit} OFFSET {offset};\""
+    );
+    format!(
+        r#"(() => {{
+  const app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+  const out = String(app.doShellScript({}));
+  const lines = out.length === 0 ? [] : out.split('\n');
+  const total = Number(lines[0]) || 0;
+  const chats = lines.slice(1).map(line => {{
+    const [identifier, display_name, service, handle, message_count, last_activity] = line.split('|||');
+    return {{identifier: identifier, display_name: display_name, service: service,
+            handle: handle, message_count: Number(message_count) || 0,
+            last_activity: last_activity}};
+  }});
+  return {{total: total, offset: {}, limit: {}, chats: chats}};
+}})()"#,
+        js_str(&cmd),
         offset,
         limit,
     )

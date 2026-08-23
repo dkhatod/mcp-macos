@@ -213,6 +213,8 @@ async fn enabled_tools_trim_discovery_and_calls() {
         mail: true,
         messages: false,
         calendar: false,
+        contacts: false,
+        reminders: false,
         notifications: false,
         clipboard: false,
     };

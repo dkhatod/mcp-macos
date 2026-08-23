@@ -80,12 +80,17 @@ $ cargo install mcp-macos        # or download a release binary
 | `mail_search` | Search message metadata (never bodies) across all accounts by default; optional account/mailbox narrowing; `group_by="sender"/"subject"` aggregates rows into counts with `latest_id` for triage; `include_snippets=false` for fast pages | auto |
 | `mail_read` | Read one full message by id | auto |
 | `mail_send` | Send email | soft-gated |
+| `messages_chats` | List chats (identifier, name, service, handle, last activity) for send addressing | auto |
 | `messages_read` | Read iMessage/SMS history from chat.db | auto |
 | `messages_send` | Send iMessage/SMS | soft-gated |
+| `contacts_search` | Search Contacts: name/org/email → id, emails, phones (read-only) | auto |
 | `calendar_list` | List calendar names | auto |
 | `calendar_read` | Events in a time range, paginated | auto |
-| `calendar_create` | Create an event | soft-gated |
+| `calendar_create` | Create an event (named calendar, location, notes) | soft-gated |
 | `calendar_update` | Modify an event by uid | soft-gated |
+| `calendar_delete` | Delete an event by uid (reversible in Calendar) | soft-gated |
+| `reminders_list_lists` / `reminders_read` | List reminder lists / read open reminders | auto |
+| `reminders_create` / `reminders_complete` | Create / complete a reminder | soft-gated |
 | `notifications_post` | Post a local notification banner | auto |
 | `clipboard_get` / `clipboard_set` | Read / write the pasteboard | auto |
 | `permissions_check` | TCC doctor: per-app Automation status + fix | auto |
@@ -115,7 +120,8 @@ MCP_MACOS_TOOLS=mail mcp-macos        # equivalent via env
 ```
 
 Disabled groups are hidden from `tools/list` and refuse `tools/call`.
-`permissions_check` is always available.
+Groups: `mail`, `messages`, `calendar`, `contacts`, `reminders`,
+`notifications`, `clipboard`. `permissions_check` is always available.
 
 ## Requirements
 

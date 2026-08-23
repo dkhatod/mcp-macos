@@ -63,22 +63,35 @@ impl<T: AppleTransport> CalendarToolset<T> {
         Ok(v.to_string())
     }
 
-    /// Creates an event on the first calendar. Soft-gated.
+    /// Creates an event. `calendar` names the target (default: first
+    /// calendar, reported in the response). Soft-gated.
+    #[allow(clippy::too_many_arguments)] // mirrors wire params
     pub async fn create(
         &mut self,
         title: &str,
         start: &str,
         end: &str,
+        calendar: Option<&str>,
+        location: Option<&str>,
+        notes: Option<&str>,
         token: Option<&str>,
     ) -> Result<String, AppleError> {
-        let payload = json!({ "title": title, "start": start, "end": end });
+        let payload = json!({
+            "title": title, "start": start, "end": end,
+            "calendar": calendar, "location": location, "notes": notes,
+        });
         match self.check("calendar.create", &payload, token).await? {
             GateOutcome::Confirm { payload, token } => Ok(confirm_response(payload, token)),
             GateOutcome::Execute => {
-                let v = run_jxa_json(&mut self.transport, &create_expr(title, start, end)).await?;
+                let v = run_jxa_json(
+                    &mut self.transport,
+                    &create_expr(title, start, end, calendar, location, notes),
+                )
+                .await?;
                 Ok(json!({
                     "status": "created",
                     "id": v.get("id").cloned().unwrap_or(Value::Null),
+                    "calendar": v.get("calendar").cloned().unwrap_or(Value::Null),
                 })
                 .to_string())
             }
@@ -87,25 +100,43 @@ impl<T: AppleTransport> CalendarToolset<T> {
 
     /// Updates an event found by uid. Only provided fields change.
     /// Soft-gated.
+    #[allow(clippy::too_many_arguments)] // mirrors wire params
     pub async fn update(
         &mut self,
         id: &str,
         title: Option<&str>,
         start: Option<&str>,
         end: Option<&str>,
+        location: Option<&str>,
+        notes: Option<&str>,
         token: Option<&str>,
     ) -> Result<String, AppleError> {
         let payload = json!({
-            "id": id,
-            "title": title,
-            "start": start,
-            "end": end,
+            "id": id, "title": title, "start": start, "end": end,
+            "location": location, "notes": notes,
         });
         match self.check("calendar.update", &payload, token).await? {
             GateOutcome::Confirm { payload, token } => Ok(confirm_response(payload, token)),
             GateOutcome::Execute => {
-                run_jxa_json(&mut self.transport, &update_expr(id, title, start, end)).await?;
+                run_jxa_json(
+                    &mut self.transport,
+                    &update_expr(id, title, start, end, location, notes),
+                )
+                .await?;
                 Ok(json!({ "status": "updated", "id": id }).to_string())
+            }
+        }
+    }
+
+    /// Deletes (marks deleted — reversible in Calendar) an event by uid.
+    /// Soft-gated.
+    pub async fn delete(&mut self, id: &str, token: Option<&str>) -> Result<String, AppleError> {
+        let payload = json!({ "id": id });
+        match self.check("calendar.delete", &payload, token).await? {
+            GateOutcome::Confirm { payload, token } => Ok(confirm_response(payload, token)),
+            GateOutcome::Execute => {
+                run_jxa_json(&mut self.transport, &delete_expr(id)).await?;
+                Ok(json!({ "status": "deleted", "id": id }).to_string())
             }
         }
     }
@@ -189,25 +220,68 @@ fn read_expr(start: Option<String>, end: Option<String>, limit: u32, offset: u32
     )
 }
 
-fn create_expr(title: &str, start: &str, end: &str) -> String {
+fn create_expr(
+    title: &str,
+    start: &str,
+    end: &str,
+    calendar: Option<&str>,
+    location: Option<&str>,
+    notes: Option<&str>,
+) -> String {
+    // Named calendar resolves with an explicit miss error; unnamed keeps
+    // the historical default (first calendar) and says so in the response.
+    let cal_clause = match calendar {
+        Some(name) => format!(
+            "const hits = C.calendars.whose({{name: {}}})();\n  \
+             if (!hits.length) throw new Error('calendar not found: {}');\n  \
+             const cal = hits[0];",
+            js_str(name),
+            js_str(name)
+        ),
+        None => "const cal = C.calendars[0];".to_string(),
+    };
+    let extra_props = [
+        location.map(|l| format!("location: {}", js_str(l))),
+        notes.map(|n| format!("description: {}", js_str(n))),
+    ];
+    let props = extra_props
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"(() => {{
   const C = Application('Calendar');
-  const cal = C.calendars[0];
-  const ev = C.Event({{summary: {}, startDate: new Date(Date.parse({})), endDate: new Date(Date.parse({}))}}).make({{at: cal}});
-  return {{id: String(ev.uid())}};
+  {}
+  const ev = C.Event({{summary: {}, startDate: new Date(Date.parse({})), endDate: new Date(Date.parse({})){}}}).make({{at: cal}});
+  return {{id: String(ev.uid()), calendar: String(cal.name())}};
 }})()"#,
+        cal_clause,
         js_str(title),
         js_str(start),
         js_str(end),
+        if props.is_empty() {
+            String::new()
+        } else {
+            format!(", {props}")
+        },
     )
 }
 
-fn update_expr(id: &str, title: Option<&str>, start: Option<&str>, end: Option<&str>) -> String {
+fn update_expr(
+    id: &str,
+    title: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
+    location: Option<&str>,
+    notes: Option<&str>,
+) -> String {
     let sets = [
         title.map(|t| format!("e.summary = {};", js_str(t))),
         start.map(|s| format!("e.startDate = new Date(Date.parse({}));", js_str(s))),
         end.map(|s| format!("e.endDate = new Date(Date.parse({}));", js_str(s))),
+        location.map(|l| format!("e.location = {};", js_str(l))),
+        notes.map(|n| format!("e.description = {};", js_str(n))),
     ];
     let body: String = sets.into_iter().flatten().collect();
     format!(
@@ -225,5 +299,25 @@ fn update_expr(id: &str, title: Option<&str>, start: Option<&str>, end: Option<&
 }})()"#,
         js_str(id),
         body,
+    )
+}
+
+/// Deletion marks the event `deleted` (Calendar's own soft delete — the
+/// event stays recoverable in the UI), keeping the MCP verb reversible.
+fn delete_expr(id: &str) -> String {
+    format!(
+        r#"(() => {{
+  const C = Application('Calendar');
+  for (const cal of C.calendars()) {{
+    const hits = cal.events.whose({{uid: {}}});
+    if (hits.length > 0) {{
+      const e = hits[0];
+      e.deleted = true;
+      return {{id: String(e.uid())}};
+    }}
+  }}
+  throw new Error('event not found');
+}})()"#,
+        js_str(id),
     )
 }

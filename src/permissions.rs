@@ -22,6 +22,14 @@ const PROBES: &[(&str, &str)] = &[
         "Messages",
         "(() => { return Application('Messages').accounts.length; })()",
     ),
+    (
+        "Contacts",
+        "(() => { return Application('Contacts').people().length; })()",
+    ),
+    (
+        "Reminders",
+        "(() => { return Application('Reminders').lists().length; })()",
+    ),
 ];
 
 /// Runs all probes. Response shape:

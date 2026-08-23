@@ -75,6 +75,9 @@ async fn create_is_soft_gated_then_executes() {
             "2026-08-25T10:00:00Z",
             "2026-08-25T10:30:00Z",
             None,
+            None,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -88,6 +91,9 @@ async fn create_is_soft_gated_then_executes() {
             "Dentist",
             "2026-08-25T10:00:00Z",
             "2026-08-25T10:30:00Z",
+            None,
+            None,
+            None,
             Some(&token),
         )
         .await
@@ -101,7 +107,7 @@ async fn create_is_soft_gated_then_executes() {
 async fn update_is_soft_gated() {
     let mut f = fixture(&[r#"{"ok":true,"value":{"id":"e1"}}"#]);
     let first =
-        f.ts.update("e1", Some("New title"), None, None, None)
+        f.ts.update("e1", Some("New title"), None, None, None, None, None)
             .await
             .unwrap();
     let v: serde_json::Value = serde_json::from_str(&first).unwrap();
@@ -109,11 +115,77 @@ async fn update_is_soft_gated() {
 
     let token = v["confirmation_token"].as_str().unwrap().to_string();
     let second =
-        f.ts.update("e1", Some("New title"), None, None, Some(&token))
-            .await
-            .unwrap();
+        f.ts.update(
+            "e1",
+            Some("New title"),
+            None,
+            None,
+            None,
+            None,
+            Some(&token),
+        )
+        .await
+        .unwrap();
     let v2: serde_json::Value = serde_json::from_str(&second).unwrap();
     assert_eq!(v2["status"], "updated");
+}
+
+#[tokio::test]
+async fn delete_is_soft_gated_and_marks_deleted() {
+    let mut f = fixture(&[
+        r#"{"ok":true,"value":{"id":"e1"}}"#,
+        r#"{"ok":true,"value":{"id":"e1"}}"#,
+    ]);
+    let first = f.ts.delete("e1", None).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(v["status"], "requires_confirmation");
+    assert_eq!(f.ts.transport.calls().len(), 0);
+
+    let token = v["confirmation_token"].as_str().unwrap().to_string();
+    let second = f.ts.delete("e1", Some(&token)).await.unwrap();
+    let v2: serde_json::Value = serde_json::from_str(&second).unwrap();
+    assert_eq!(v2["status"], "deleted");
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(script.contains(r#"whose({uid: "e1"})"#), "{script}");
+    assert!(script.contains("e.deleted = true;"), "{script}");
+}
+
+#[tokio::test]
+async fn create_targets_named_calendar_with_location() {
+    let mut f = fixture(&[r#"{"ok":true,"value":{"id":"e2","calendar":"Work"}}"#]);
+    let first =
+        f.ts.create(
+            "Interview",
+            "2026-08-25T09:00:00Z",
+            "2026-08-25T10:00:00Z",
+            Some("Work"),
+            Some("Room 4"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(v["status"], "requires_confirmation");
+
+    let token = v["confirmation_token"].as_str().unwrap().to_string();
+    f.ts.create(
+        "Interview",
+        "2026-08-25T09:00:00Z",
+        "2026-08-25T10:00:00Z",
+        Some("Work"),
+        Some("Room 4"),
+        None,
+        Some(&token),
+    )
+    .await
+    .unwrap();
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(
+        script.contains(r#"whose({name: "Work"})"#),
+        "named calendar targeted: {script}"
+    );
+    assert!(script.contains(r#"location: "Room 4""#), "{script}");
 }
 
 #[cfg(target_os = "macos")]

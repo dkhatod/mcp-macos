@@ -21,19 +21,23 @@ use tokio::sync::Mutex;
 
 pub mod calendar;
 pub mod clipboard;
+pub mod contacts;
 pub mod mail;
 pub mod messages;
 pub mod notifications;
 pub mod permissions;
 pub mod policy;
+pub mod reminders;
 pub mod util;
 
 use calendar::CalendarToolset;
 use clipboard::ClipboardToolset;
+use contacts::ContactsToolset;
 use mail::MailToolset;
 use messages::MessagesToolset;
 use notifications::NotificationsToolset;
 use personai_core::macos::{AppleError, JxaTransport};
+use reminders::RemindersToolset;
 
 /// Default page size for list/search tools.
 pub(crate) const DEFAULT_LIMIT: u32 = 20;
@@ -57,6 +61,8 @@ pub struct EnabledTools {
     pub mail: bool,
     pub messages: bool,
     pub calendar: bool,
+    pub contacts: bool,
+    pub reminders: bool,
     pub notifications: bool,
     pub clipboard: bool,
 }
@@ -67,6 +73,8 @@ impl EnabledTools {
             mail: true,
             messages: true,
             calendar: true,
+            contacts: true,
+            reminders: true,
             notifications: true,
             clipboard: true,
         }
@@ -78,6 +86,8 @@ impl EnabledTools {
             mail: false,
             messages: false,
             calendar: false,
+            contacts: false,
+            reminders: false,
             notifications: false,
             clipboard: false,
         };
@@ -86,11 +96,13 @@ impl EnabledTools {
                 "mail" => e.mail = true,
                 "messages" => e.messages = true,
                 "calendar" => e.calendar = true,
+                "contacts" => e.contacts = true,
+                "reminders" => e.reminders = true,
                 "notifications" => e.notifications = true,
                 "clipboard" => e.clipboard = true,
                 other => {
                     return Err(format!(
-                        "unknown tool group '{other}' (valid: mail, messages, calendar, notifications, clipboard)"
+                        "unknown tool group '{other}' (valid: mail, messages, calendar, contacts, reminders, notifications, clipboard)"
                     ));
                 }
             }
@@ -105,6 +117,10 @@ impl EnabledTools {
             self.messages
         } else if tool_name.starts_with("calendar_") {
             self.calendar
+        } else if tool_name.starts_with("contacts_") {
+            self.contacts
+        } else if tool_name.starts_with("reminders_") {
+            self.reminders
         } else if tool_name.starts_with("notifications_") {
             self.notifications
         } else if tool_name.starts_with("clipboard_") {
@@ -127,6 +143,8 @@ pub struct ServerState {
     mail: Mutex<MailToolset<JxaTransport>>,
     messages: Mutex<MessagesToolset<JxaTransport>>,
     calendar: Mutex<CalendarToolset<JxaTransport>>,
+    contacts: Mutex<ContactsToolset<JxaTransport>>,
+    reminders: Mutex<RemindersToolset<JxaTransport>>,
     notifications: Mutex<NotificationsToolset<JxaTransport>>,
     clipboard: Mutex<ClipboardToolset>,
 }
@@ -190,6 +208,14 @@ impl MacosServer {
                     .unwrap_or_else(|e| {
                         eprintln!("calendar gate unavailable ({e}); writes will refuse");
                         CalendarToolset::new(JxaTransport)
+                    }),
+            ),
+            contacts: Mutex::new(ContactsToolset::new(JxaTransport)),
+            reminders: Mutex::new(
+                RemindersToolset::with_gate(JxaTransport, gated("tokens.reminders.json"))
+                    .unwrap_or_else(|e| {
+                        eprintln!("reminders gate unavailable ({e}); writes will refuse");
+                        RemindersToolset::new(JxaTransport)
                     }),
             ),
             notifications: Mutex::new(NotificationsToolset::new(JxaTransport)),
@@ -572,6 +598,18 @@ impl MacosServer {
     }
 
     #[tool(
+        description = "List iMessage/SMS chats: identifier, display name, service, a sample participant handle, message count, and last activity — most recent first. THE way to resolve 'send to NAME' into a concrete handle before messages_send.",
+        annotations(read_only_hint = true)
+    )]
+    async fn messages_chats(&self, Parameters(p): Parameters<MessagesReadParams>) -> String {
+        if !self.enabled.messages {
+            return Self::disabled("messages");
+        }
+        let mut st = self.inner.messages.lock().await;
+        json_result(st.chats(p.limit, p.offset.unwrap_or(0)).await)
+    }
+
+    #[tool(
         description = "Send an iMessage/SMS. Soft-gated: the first call returns status requires_confirmation with a confirmation_token and does NOT send; re-invoke with confirmation_token to execute. Tokens are single-use and expire in 5 minutes.",
         annotations(destructive_hint = true)
     )]
@@ -586,6 +624,96 @@ impl MacosServer {
         )
     }
 
+    // --- Contacts -----------------------------------------------------------
+
+    #[tool(
+        description = "Search macOS Contacts (READ-ONLY): case-insensitive substring over name, organization, and emails; empty query lists the directory. Returns {total, offset, limit, contacts:[{id, name, organization, emails, phones}]} paginated. Use to resolve 'email Mom' / 'text Sam' into concrete addresses and handles.",
+        annotations(read_only_hint = true)
+    )]
+    async fn contacts_search(&self, Parameters(p): Parameters<ContactsSearchParams>) -> String {
+        if !self.enabled.contacts {
+            return Self::disabled("contacts");
+        }
+        let mut st = self.inner.contacts.lock().await;
+        json_result(
+            st.search(
+                p.query.as_deref().unwrap_or(""),
+                p.limit,
+                p.offset.unwrap_or(0),
+            )
+            .await,
+        )
+    }
+
+    // --- Reminders ----------------------------------------------------------
+
+    #[tool(
+        description = "List reminder list names on this Mac.",
+        annotations(read_only_hint = true)
+    )]
+    async fn reminders_list_lists(&self) -> String {
+        if !self.enabled.reminders {
+            return Self::disabled("reminders");
+        }
+        let mut st = self.inner.reminders.lock().await;
+        json_result(st.list_lists().await)
+    }
+
+    #[tool(
+        description = "Read reminders (open items unless include_completed). Optional list name filter. Returns {total, offset, limit, reminders:[{id, name, due, body, priority, completed}]}.",
+        annotations(read_only_hint = true)
+    )]
+    async fn reminders_read(&self, Parameters(p): Parameters<RemindersReadParams>) -> String {
+        if !self.enabled.reminders {
+            return Self::disabled("reminders");
+        }
+        let mut st = self.inner.reminders.lock().await;
+        json_result(
+            st.read(
+                p.list.clone(),
+                p.include_completed.unwrap_or(false),
+                p.limit,
+                p.offset.unwrap_or(0),
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Create a reminder (optional list, due date ISO 8601, notes). Soft-gated: first call returns requires_confirmation + confirmation_token and does NOT create; re-invoke with the token (single-use, 5-min TTL).",
+        annotations(destructive_hint = true)
+    )]
+    async fn reminders_create(&self, Parameters(p): Parameters<RemindersCreateParams>) -> String {
+        if !self.enabled.reminders {
+            return Self::disabled("reminders");
+        }
+        let mut st = self.inner.reminders.lock().await;
+        json_result(
+            st.create(
+                &p.name,
+                p.list.as_deref(),
+                p.due.as_deref(),
+                p.notes.as_deref(),
+                p.confirmation_token.as_deref(),
+            )
+            .await,
+        )
+    }
+
+    #[tool(
+        description = "Mark a reminder completed by id (from reminders_read). Soft-gated like reminders_create.",
+        annotations(destructive_hint = true)
+    )]
+    async fn reminders_complete(
+        &self,
+        Parameters(p): Parameters<RemindersCompleteParams>,
+    ) -> String {
+        if !self.enabled.reminders {
+            return Self::disabled("reminders");
+        }
+        let mut st = self.inner.reminders.lock().await;
+        json_result(st.complete(&p.id, p.confirmation_token.as_deref()).await)
+    }
     // --- Notifications ------------------------------------------------------
 
     #[tool(
@@ -629,7 +757,7 @@ impl MacosServer {
     }
 
     #[tool(
-        description = "Create a calendar event (first calendar). Soft-gated: first call returns requires_confirmation + confirmation_token and does NOT create; re-invoke with the token. Tokens single-use, 5-minute TTL. Example: calendar_create(title=\"Interview\", start=\"2026-08-25T09:00:00Z\", end=\"2026-08-25T10:00:00Z\").",
+        description = "Create a calendar event on a named calendar (default: first calendar, reported back). Optional location and notes. Soft-gated: first call returns requires_confirmation + confirmation_token and does NOT create; re-invoke with the token. Tokens single-use, 5-minute TTL. Example: calendar_create(title=\"Interview\", start=\"2026-08-25T09:00:00Z\", end=\"2026-08-25T10:00:00Z\", calendar=\"Work\").",
         annotations(destructive_hint = true)
     )]
     async fn calendar_create(&self, Parameters(p): Parameters<CalendarCreateParams>) -> String {
@@ -638,13 +766,20 @@ impl MacosServer {
         }
         let mut st = self.inner.calendar.lock().await;
         json_result(
-            st.create(&p.title, &p.start, &p.end, p.confirmation_token.as_deref())
-                .await,
+            st.create(
+                &p.title,
+                &p.start,
+                &p.end,
+                p.calendar.as_deref(),
+                p.location.as_deref(),
+                p.notes.as_deref(),
+                p.confirmation_token.as_deref(),
+            )
+            .await,
         )
     }
-
     #[tool(
-        description = "Update an event by id (uid from calendar_read); only provided fields change. Soft-gated: first call returns requires_confirmation + confirmation_token and does NOT modify; re-invoke with the token (single-use, 5-min TTL). Example: calendar_update(id=\"abc\", start=\"2026-08-25T10:00:00Z\").",
+        description = "Update an event by id (uid from calendar_read); only provided fields change (title, start, end, location, notes). Soft-gated: first call returns requires_confirmation + confirmation_token and does NOT modify; re-invoke with the token (single-use, 5-min TTL). Example: calendar_update(id=\"abc\", start=\"2026-08-25T10:00:00Z\").",
         annotations(destructive_hint = true)
     )]
     async fn calendar_update(&self, Parameters(p): Parameters<CalendarUpdateParams>) -> String {
@@ -658,10 +793,24 @@ impl MacosServer {
                 p.title.as_deref(),
                 p.start.as_deref(),
                 p.end.as_deref(),
+                p.location.as_deref(),
+                p.notes.as_deref(),
                 p.confirmation_token.as_deref(),
             )
             .await,
         )
+    }
+
+    #[tool(
+        description = "Delete an event by id (uid from calendar_read). Marks the event deleted — recoverable in Calendar's UI. Soft-gated like other writes.",
+        annotations(destructive_hint = true)
+    )]
+    async fn calendar_delete(&self, Parameters(p): Parameters<CalendarDeleteParams>) -> String {
+        if !self.enabled.calendar {
+            return Self::disabled("calendar");
+        }
+        let mut st = self.inner.calendar.lock().await;
+        json_result(st.delete(&p.id, p.confirmation_token.as_deref()).await)
     }
 
     // --- Clipboard ----------------------------------------------------------
@@ -717,8 +866,8 @@ impl MacosServer {
 #[tool_handler(
     router = Self::tool_router(),
     name = "mcp-macos",
-    version = "0.1.6",
-    instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> mail_search then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
+    version = "0.1.7",
+    instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> mail_search then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update/calendar_delete; recipient names (people) -> contacts_search first, chat handles -> messages_chats first; task items -> reminders_read/reminders_create/reminders_complete; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
 )]
 impl rmcp::ServerHandler for MacosServer {
     async fn list_tools(
@@ -914,6 +1063,16 @@ pub struct CalendarCreateParams {
     pub start: String,
     /// End time (ISO 8601).
     pub end: String,
+    /// Target calendar name (default: first calendar; the response
+    /// reports which one was used). Discover via calendar_list.
+    #[serde(default)]
+    pub calendar: Option<String>,
+    /// Optional location string.
+    #[serde(default)]
+    pub location: Option<String>,
+    /// Optional notes/description.
+    #[serde(default)]
+    pub notes: Option<String>,
     /// Token from a previous requires_confirmation response.
     #[serde(default)]
     pub confirmation_token: Option<String>,
@@ -932,6 +1091,78 @@ pub struct CalendarUpdateParams {
     /// New end time (optional, ISO 8601).
     #[serde(default)]
     pub end: Option<String>,
+    /// New location (optional).
+    #[serde(default)]
+    pub location: Option<String>,
+    /// New notes/description (optional).
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct CalendarDeleteParams {
+    /// Event uid from calendar_read.
+    pub id: String,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ContactsSearchParams {
+    /// Case-insensitive substring matched against name, organization, and
+    /// email addresses. Empty = directory census.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Page size (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Page offset (default 0).
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RemindersReadParams {
+    /// Optional reminder list name filter.
+    #[serde(default)]
+    pub list: Option<String>,
+    /// Include completed items (default false).
+    #[serde(default)]
+    pub include_completed: Option<bool>,
+    /// Page size (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Page offset (default 0).
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RemindersCreateParams {
+    /// Reminder name/title.
+    pub name: String,
+    /// Target list name (default: default list).
+    #[serde(default)]
+    pub list: Option<String>,
+    /// Due date (ISO 8601), optional.
+    #[serde(default)]
+    pub due: Option<String>,
+    /// Notes/body text, optional.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Token from a previous requires_confirmation response.
+    #[serde(default)]
+    pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RemindersCompleteParams {
+    /// Reminder id from reminders_read.
+    pub id: String,
     /// Token from a previous requires_confirmation response.
     #[serde(default)]
     pub confirmation_token: Option<String>,

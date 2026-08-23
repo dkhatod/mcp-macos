@@ -5,8 +5,8 @@ use personai_core::macos::MockTransport;
 #[tokio::test]
 async fn reports_each_target_app() {
     let mut t = MockTransport::new();
-    // One probe per target app: Mail, Calendar, Messages (in order).
-    for _ in 0..3 {
+    // One probe per target app: Mail, Calendar, Messages, Contacts, Reminders.
+    for _ in 0..5 {
         t.enqueue(r#"{"ok":true,"value":1}"#);
     }
     let res = mcp_macos::permissions::check(&mut t).await.unwrap();
@@ -17,7 +17,10 @@ async fn reports_each_target_app() {
         .iter()
         .map(|p| p["app"].as_str().unwrap())
         .collect();
-    assert_eq!(apps, vec!["Mail", "Calendar", "Messages"]);
+    assert_eq!(
+        apps,
+        vec!["Mail", "Calendar", "Messages", "Contacts", "Reminders"]
+    );
     assert!(
         v["permissions"].as_array().unwrap()[0]["ok"]
             .as_bool()
@@ -31,6 +34,8 @@ async fn denied_probe_includes_fix_hint() {
     t.enqueue(r#"{"ok":true,"value":1}"#); // Mail ok
     t.enqueue(r#"{"ok":false,"error":{"number":-1743,"desc":"not allowed"}}"#); // Calendar denied
     t.enqueue(r#"{"ok":true,"value":1}"#); // Messages ok
+    t.enqueue(r#"{"ok":true,"value":1}"#); // Contacts ok
+    t.enqueue(r#"{"ok":true,"value":1}"#); // Reminders ok
     let res = mcp_macos::permissions::check(&mut t).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     let cal = &v["permissions"][1];

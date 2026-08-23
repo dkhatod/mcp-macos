@@ -73,6 +73,38 @@ async fn send_without_gate_refuses() {
     assert!(err.to_string().contains("gate"));
 }
 
+#[tokio::test]
+async fn chats_lists_discovery_with_pagination() {
+    let mut f = fixture(&[
+        r#"{"ok":true,"value":{"total":2,"offset":0,"limit":20,"chats":[{"identifier":"+1555","display_name":"Mom","service":"iMessage","handle":"+1555","message_count":42,"last_activity":"2026-08-23 12:00:00"}]}}"#,
+    ]);
+    let res = f.ts.chats(Some(20), 0).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["chats"][0]["display_name"], "Mom");
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(
+        script.contains("SELECT COUNT(*) FROM chat"),
+        "count and page must share one invocation: {script}"
+    );
+    assert!(script.contains("GROUP BY c.ROWID"), "{script}");
+}
+
+#[tokio::test]
+async fn read_emits_single_invocation_with_total_header() {
+    let mut f =
+        fixture(&[r#"{"ok":true,"value":{"total":377160,"offset":0,"limit":30,"messages":[]}}"#]);
+    let v: serde_json::Value =
+        serde_json::from_str(&f.ts.read(None, Some(30), 0).await.unwrap()).unwrap();
+    assert_eq!(v["total"], 377160);
+    let script = &f.ts.transport.calls()[0].script;
+    // ONE sqlite3 call: total header line + page, consistent by construction.
+    let count = script.matches("sqlite3").count();
+    assert_eq!(count, 1, "single invocation expected: {script}");
+    assert!(script.contains("SELECT COUNT(*)"), "{script}");
+    assert!(script.contains("LIMIT 30 OFFSET 0"), "{script}");
+}
+
 /// macOS only, read-only: reads real chat.db. Requires Full Disk Access for
 /// the calling terminal; skips (does not fail) when the DB is unreadable so
 /// CI runners without FDA still pass.

@@ -3,6 +3,27 @@
 All notable changes. Format follows [Keep a Changelog](https://keepachangelog.com);
 versions are semver (0.x: breaking changes bump minor).
 
+## [0.1.7] — 2026-08-23
+
+### Added
+- `contacts_search` (read-only): case-insensitive search over name,
+  organization, and emails; bulk-fetch + JS filter, page-sized detail
+  hydration. Resolves "email Mom" / "text Sam" into concrete addresses.
+- Reminders group: `reminders_list_lists`, `reminders_read` (open items
+  by default), `reminders_create`, `reminders_complete` — writes
+  soft-gated like calendar writes.
+- `messages_chats`: chat discovery (identifier, display name, service,
+  sample handle, count, last activity) so sends stop guessing handles.
+- Calendar completion: `calendar_create`/`calendar_update` accept target
+  calendar name (response reports which was used), location, and notes;
+  new soft-gated `calendar_delete` marks events deleted (reversible in
+  the Calendar UI).
+
+### Fixed
+- `messages_read` now emits ONE sqlite3 invocation whose output starts
+  with the filtered total followed by the page — total and page are
+  consistent by construction instead of counting the whole database.
+
 ## [0.1.6] — 2026-08-23
 
 ### Fixed
