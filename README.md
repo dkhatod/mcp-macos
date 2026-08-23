@@ -18,20 +18,41 @@ $ cargo install mcp-macos        # or download a release binary
 2. **Grant permissions** (first run only): add the server to your MCP client,
    call `permissions_check`, and approve the Automation prompts. See
    [docs/safety.md](docs/safety.md#permissions).
-3. **Wire it into your client.** For Oh My Pi (`mcp.json`):
+3. **Wire it into your MCP client.** An installed binary does nothing until
+   your client's config registers it — the server only mounts at session
+   start. Give it a distinctive name: if another server already uses a
+   near-identical one (e.g. the unrelated `macos-mcp` desktop-automation
+   npm package), you may believe yours is connected when it isn't.
 
-```json
-{
-  "mcpServers": {
-    "macos": {
-      "command": "mcp-macos",
-      "args": ["--state-dir", "~/.personai/state"]
-    }
-  }
-}
-```
+   Oh My Pi (`~/.omp/agent/mcp.json`, or project `.omp/mcp.json`):
 
-4. **Call a tool.** Example `mail_search` response:
+   ```json
+   {
+     "mcpServers": {
+       "mcp-macos": {
+         "command": "/Users/YOU/.cargo/bin/mcp-macos",
+         "args": ["--state-dir", "~/.personai/state"]
+       }
+     }
+   }
+   ```
+
+   Claude Code: `claude mcp add mcp-macos -- ~/.cargo/bin/mcp-macos`
+
+   Cursor / Windsurf / generic (`mcp.json`): same shape as the OMP block
+   above under `"mcpServers"`.
+
+4. **Verify the mount before real use.** Start a fresh session (servers do
+   not hot-load into running ones) and confirm your agent sees the tools:
+
+   - OMP: `/mcp list` shows the server; ask the agent *"list your
+     mail-related tools"* — expect `mail_search`, `mail_read`,
+     `mail_list_accounts`.
+   - Any client: same question works; if the answer describes AppleScript
+     instead, the mount failed — check the config path and name collisions,
+     then restart the session.
+
+5. **Call a tool.** Example `mail_search` response:
 
 ```json
 {
@@ -56,7 +77,7 @@ $ cargo install mcp-macos        # or download a release binary
 |---|---|---|
 | `mail_list_accounts` | List accounts with identity details (email, type) | auto |
 | `mail_list_mailboxes` | List mailboxes per account with counts | auto |
-| `mail_search` | Search message metadata (never bodies) across all accounts by default; optional account/mailbox narrowing | auto |
+| `mail_search` | Search message metadata (never bodies) across all accounts by default; optional account/mailbox narrowing; `group_by="sender"/"subject"` aggregates rows into counts with `latest_id` for triage; `include_snippets=false` for fast pages | auto |
 | `mail_read` | Read one full message by id | auto |
 | `mail_send` | Send email | soft-gated |
 | `messages_read` | Read iMessage/SMS history from chat.db | auto |

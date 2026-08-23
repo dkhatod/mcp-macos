@@ -109,16 +109,17 @@ impl EnabledTools {
 
 /// Mutable server state shared by all tools.
 ///
-/// The MCP handler methods take `&self`; everything that must mutate
-/// (transports, gates) lives here behind an async mutex, because tool bodies
-/// await subprocesses while holding the lock. Each field is one tool group;
-/// groups never touch each other.
+/// The MCP handler methods take `&self`; each group's toolset must mutate
+/// (transports, gates), so every field carries its own async mutex — tool
+/// bodies await subprocesses while holding it. One mutex PER GROUP: a slow
+/// mail_search must not block a concurrent clipboard_get, and agents do
+/// issue parallel calls. Groups never touch each other.
 pub struct ServerState {
-    mail: MailToolset<JxaTransport>,
-    messages: MessagesToolset<JxaTransport>,
-    calendar: CalendarToolset<JxaTransport>,
-    notifications: NotificationsToolset<JxaTransport>,
-    clipboard: ClipboardToolset,
+    mail: Mutex<MailToolset<JxaTransport>>,
+    messages: Mutex<MessagesToolset<JxaTransport>>,
+    calendar: Mutex<CalendarToolset<JxaTransport>>,
+    notifications: Mutex<NotificationsToolset<JxaTransport>>,
+    clipboard: Mutex<ClipboardToolset>,
 }
 
 /// The MCP server handle passed to every tool method.
@@ -131,7 +132,7 @@ pub struct MacosServer {
     enabled: EnabledTools,
     scope: policy::EffectiveScope,
     policy: Arc<policy::MailPolicy>,
-    inner: Arc<Mutex<ServerState>>,
+    inner: Arc<ServerState>,
 }
 
 #[tool_router]
@@ -160,31 +161,37 @@ impl MacosServer {
     ) -> Self {
         let gated = |store: &str| state_dir.join(store);
         let state = ServerState {
-            mail: MailToolset::with_gate(JxaTransport, gated("tokens.mail.json")).unwrap_or_else(
-                |e| {
-                    eprintln!("mail gate unavailable ({e}); mail_send will refuse");
-                    MailToolset::new(JxaTransport)
-                },
+            mail: Mutex::new(
+                MailToolset::with_gate(JxaTransport, gated("tokens.mail.json")).unwrap_or_else(
+                    |e| {
+                        eprintln!("mail gate unavailable ({e}); mail_send will refuse");
+                        MailToolset::new(JxaTransport)
+                    },
+                ),
             ),
-            messages: MessagesToolset::with_gate(JxaTransport, gated("tokens.messages.json"))
-                .unwrap_or_else(|e| {
-                    eprintln!("messages gate unavailable ({e}); messages_send will refuse");
-                    MessagesToolset::new(JxaTransport)
-                }),
-            calendar: CalendarToolset::with_gate(JxaTransport, gated("tokens.calendar.json"))
-                .unwrap_or_else(|e| {
-                    eprintln!("calendar gate unavailable ({e}); writes will refuse");
-                    CalendarToolset::new(JxaTransport)
-                }),
-            notifications: NotificationsToolset::new(JxaTransport),
-            clipboard: ClipboardToolset::new(),
+            messages: Mutex::new(
+                MessagesToolset::with_gate(JxaTransport, gated("tokens.messages.json"))
+                    .unwrap_or_else(|e| {
+                        eprintln!("messages gate unavailable ({e}); messages_send will refuse");
+                        MessagesToolset::new(JxaTransport)
+                    }),
+            ),
+            calendar: Mutex::new(
+                CalendarToolset::with_gate(JxaTransport, gated("tokens.calendar.json"))
+                    .unwrap_or_else(|e| {
+                        eprintln!("calendar gate unavailable ({e}); writes will refuse");
+                        CalendarToolset::new(JxaTransport)
+                    }),
+            ),
+            notifications: Mutex::new(NotificationsToolset::new(JxaTransport)),
+            clipboard: Mutex::new(ClipboardToolset::new()),
         };
         Self {
             state_dir,
             enabled,
             policy: Arc::new(policy),
             scope,
-            inner: Arc::new(Mutex::new(state)),
+            inner: Arc::new(state),
         }
     }
 
@@ -209,15 +216,15 @@ impl MacosServer {
     // --- Mail ---------------------------------------------------------------
 
     #[tool(
-        description = "List Mail accounts with identity details (name, email address, type, enabled). Display names alone are often just 'Google'/'Exchange' — use the email field to tell accounts apart. Runs across ALL configured accounts.",
+        description = "List Mail accounts with identity details (name, email address, type, enabled) across ALL configured accounts. Run this at the START of any multi-step Mail task so account-scoped calls use exact names — display names are often just 'Google'/'Exchange'; the email field disambiguates.",
         annotations(read_only_hint = true)
     )]
     async fn mail_list_accounts(&self) -> String {
         if !self.enabled.mail {
             return Self::disabled("mail");
         }
-        let mut st = self.inner.lock().await;
-        json_result(st.mail.list_accounts().await)
+        let mut st = self.inner.mail.lock().await;
+        json_result(st.list_accounts().await)
     }
 
     #[tool(
@@ -228,36 +235,48 @@ impl MacosServer {
         if !self.enabled.mail {
             return Self::disabled("mail");
         }
-        let mut st = self.inner.lock().await;
-        json_result(st.mail.list_mailboxes(p.account).await)
+        let mut st = self.inner.mail.lock().await;
+        json_result(st.list_mailboxes(p.account).await)
     }
 
     #[tool(
-        description = "Search Mail metadata (id, subject, from, date, snippet, folder — never bodies), paginated as {total, offset, limit, results, scanned_per_folder, truncated}. Pass folders=[\"Account/Mailbox\", …] to select one or more specific mailboxes for this call (each entry must lie inside the configured scope — run mail_config to see it; split on the last '/'); otherwise account narrows to that account's inbox (account+mailbox targets a specific mailbox), and with neither the unified inbox of ALL accounts is searched. truncated:true means the scan budget expired mid-search: results are partial, with per-folder counts in scanned_per_folder. Use mail_read for full content. Params: since=ISO 8601 (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); limit/offset page the merged results (default 20, max 100). Example: mail_search(query=\"interview\", folders=[\"iCloud/Inbox\"]).",
+        description = "Search the user's email — THE tool for every find/check/read/summarize/triage-email request ('mail about X', 'status of my job applications', 'find receipts'), replacing AppleScript/osascript shell scripts that are slow on real mailboxes, unbounded in output, and unscoped. Matches query case-insensitively against subject or sender; returns metadata only ({id, subject, from, date, snippet, folder} — never bodies), paginated as {total, offset, limit, results, scanned_per_folder, truncated}. Target folders via folders=[\"Account/Mailbox\", ...] (each inside the configured scope — run mail_config to see it; split on the last '/'); else account narrows to that account's inbox (account+mailbox targets one specific mailbox); else the unified inbox of ALL accounts is searched. truncated:true means the scan budget expired mid-search (partial results; per-folder counts in scanned_per_folder). Prefer small pages (limit 20-50): huge pages render slowly and are often compressed by the client. For triage or summaries set group_by='sender' or 'subject': rows collapse into {total_groups, groups:[{key,name,count,first,last,latest_id,sample_subjects,folders}]} ordered by count — follow up with mail_read(latest_id) on the groups that matter. include_snippets=false skips body previews for much faster pages. Params: since ISO 8601 (YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ); limit/offset page the result set.",
         annotations(read_only_hint = true)
     )]
     async fn mail_search(&self, Parameters(p): Parameters<MailSearchParams>) -> String {
         if !self.enabled.mail {
             return Self::disabled("mail");
         }
-        // Legacy sugar kept intact: a bare `account` still means that
-        // account's inbox via the single-target engine.
+        if p.group_by.is_some()
+            && !matches!(p.group_by.as_deref(), Some("sender") | Some("subject"))
+        {
+            return serde_json::json!({"error": "group_by must be \"sender\" or \"subject\""})
+                .to_string();
+        }
+        let snippets = p.include_snippets.unwrap_or(true);
+        let group = p
+            .group_by
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(mail::MailGroupBy::parse)
+            .flatten();
         if p.folders.as_ref().is_none_or(Vec::is_empty)
             && p.mailbox.is_none()
             && p.account.is_some()
+            && group.is_none()
         {
-            let mut st = self.inner.lock().await;
+            let mut st = self.inner.mail.lock().await;
             return json_result(
-                st.mail
-                    .search(
-                        &p.query,
-                        p.account.as_deref(),
-                        None,
-                        p.since.as_deref(),
-                        p.limit,
-                        p.offset.unwrap_or(0),
-                    )
-                    .await,
+                st.search(
+                    &p.query,
+                    p.account.as_deref(),
+                    None,
+                    p.since.as_deref(),
+                    p.limit,
+                    p.offset.unwrap_or(0),
+                    snippets,
+                )
+                .await,
             );
         }
         // Per-call selection within the effective scope. Each entry is
@@ -296,30 +315,40 @@ impl MacosServer {
             mail::MailTargets::Folders(pairs)
         };
         let limit = p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        let mut st = self.inner.lock().await;
+        let mut st = self.inner.mail.lock().await;
         json_result(
-            st.mail
-                .search_multi(
-                    &targets,
-                    &p.query,
-                    p.since.as_deref(),
-                    limit,
-                    p.offset.unwrap_or(0),
-                )
-                .await,
+            st.search_multi(
+                &targets,
+                &p.query,
+                p.since.as_deref(),
+                limit,
+                p.offset.unwrap_or(0),
+                group,
+                snippets,
+            )
+            .await,
         )
     }
 
     #[tool(
-        description = "Read one full Mail message by id (an id from mail_search results).",
+        description = "Read ONE full Mail message by id (ids come from mail_search results). Use when a search snippet is not enough — e.g. checking body wording for an offer, rejection, or interview detail before reporting application status. Pass folder=\"Account/Mailbox\" from the search row to target its mailbox directly; without it the inbox is tried first, then all mailboxes. Bodies are capped at ~20k characters (body_truncated:true when clipped).",
         annotations(read_only_hint = true)
     )]
     async fn mail_read(&self, Parameters(p): Parameters<MailReadParams>) -> String {
         if !self.enabled.mail {
             return Self::disabled("mail");
         }
-        let mut st = self.inner.lock().await;
-        json_result(st.mail.read(&p.id).await)
+        if let Some(f) = p.folder.as_deref() {
+            return match f.rsplit_once('/') {
+                Some((account, mailbox)) if self.scope.allows(account, mailbox) => {
+                    let mut st = self.inner.mail.lock().await;
+                    json_result(st.read(&p.id, Some(f)).await)
+                }
+                _ => json_result(Err(Self::out_of_scope(f, &self.scope))),
+            };
+        }
+        let mut st = self.inner.mail.lock().await;
+        json_result(st.read(&p.id, None).await)
     }
 
     #[tool(
@@ -330,13 +359,13 @@ impl MacosServer {
         if !self.enabled.mail {
             return Self::disabled("mail");
         }
-        let mut st = self.inner.lock().await;
+        let mut st = self.inner.mail.lock().await;
         // Identity policy: an explicit `from` must match a live account by
         // name or primary email (case-insensitive) before anything sends.
         let from = match p.from.as_deref() {
             None => None,
             Some(want) => {
-                let raw = match st.mail.list_accounts().await {
+                let raw = match st.list_accounts().await {
                     Ok(s) => s,
                     Err(e) => return json_result(Err(e)),
                 };
@@ -384,15 +413,14 @@ impl MacosServer {
             }
         };
         json_result(
-            st.mail
-                .send(
-                    &p.to,
-                    &p.subject,
-                    &p.body,
-                    from.as_deref(),
-                    p.confirmation_token.as_deref(),
-                )
-                .await,
+            st.send(
+                &p.to,
+                &p.subject,
+                &p.body,
+                from.as_deref(),
+                p.confirmation_token.as_deref(),
+            )
+            .await,
         )
     }
 
@@ -404,16 +432,15 @@ impl MacosServer {
         if !self.enabled.mail {
             return Self::disabled("mail");
         }
-        let mut st = self.inner.lock().await;
+        let mut st = self.inner.mail.lock().await;
         json_result(
-            st.mail
-                .forward(
-                    &p.id,
-                    &p.to,
-                    p.comment.as_deref(),
-                    p.confirmation_token.as_deref(),
-                )
-                .await,
+            st.forward(
+                &p.id,
+                &p.to,
+                p.comment.as_deref(),
+                p.confirmation_token.as_deref(),
+            )
+            .await,
         )
     }
 
@@ -425,10 +452,9 @@ impl MacosServer {
         if !self.enabled.mail {
             return Self::disabled("mail");
         }
-        let mut st = self.inner.lock().await;
+        let mut st = self.inner.mail.lock().await;
         json_result(
-            st.mail
-                .reply(&p.id, &p.body, p.confirmation_token.as_deref())
+            st.reply(&p.id, &p.body, p.confirmation_token.as_deref())
                 .await,
         )
     }
@@ -457,12 +483,8 @@ impl MacosServer {
         if !self.enabled.messages {
             return Self::disabled("messages");
         }
-        let mut st = self.inner.lock().await;
-        json_result(
-            st.messages
-                .read(p.chat, p.limit, p.offset.unwrap_or(0))
-                .await,
-        )
+        let mut st = self.inner.messages.lock().await;
+        json_result(st.read(p.chat, p.limit, p.offset.unwrap_or(0)).await)
     }
 
     #[tool(
@@ -473,10 +495,9 @@ impl MacosServer {
         if !self.enabled.messages {
             return Self::disabled("messages");
         }
-        let mut st = self.inner.lock().await;
+        let mut st = self.inner.messages.lock().await;
         json_result(
-            st.messages
-                .send(&p.to, &p.body, p.confirmation_token.as_deref())
+            st.send(&p.to, &p.body, p.confirmation_token.as_deref())
                 .await,
         )
     }
@@ -490,12 +511,8 @@ impl MacosServer {
         if !self.enabled.notifications {
             return Self::disabled("notifications");
         }
-        let mut st = self.inner.lock().await;
-        json_result(
-            st.notifications
-                .post(&p.title, &p.message, p.subtitle.as_deref())
-                .await,
-        )
+        let mut st = self.inner.notifications.lock().await;
+        json_result(st.post(&p.title, &p.message, p.subtitle.as_deref()).await)
     }
 
     // --- Calendar -----------------------------------------------------------
@@ -508,8 +525,8 @@ impl MacosServer {
         if !self.enabled.calendar {
             return Self::disabled("calendar");
         }
-        let mut st = self.inner.lock().await;
-        json_result(st.calendar.list().await)
+        let mut st = self.inner.calendar.lock().await;
+        json_result(st.list().await)
     }
 
     #[tool(
@@ -520,10 +537,9 @@ impl MacosServer {
         if !self.enabled.calendar {
             return Self::disabled("calendar");
         }
-        let mut st = self.inner.lock().await;
+        let mut st = self.inner.calendar.lock().await;
         json_result(
-            st.calendar
-                .read(Some(p.start), Some(p.end), p.limit, p.offset.unwrap_or(0))
+            st.read(Some(p.start), Some(p.end), p.limit, p.offset.unwrap_or(0))
                 .await,
         )
     }
@@ -536,10 +552,9 @@ impl MacosServer {
         if !self.enabled.calendar {
             return Self::disabled("calendar");
         }
-        let mut st = self.inner.lock().await;
+        let mut st = self.inner.calendar.lock().await;
         json_result(
-            st.calendar
-                .create(&p.title, &p.start, &p.end, p.confirmation_token.as_deref())
+            st.create(&p.title, &p.start, &p.end, p.confirmation_token.as_deref())
                 .await,
         )
     }
@@ -552,17 +567,16 @@ impl MacosServer {
         if !self.enabled.calendar {
             return Self::disabled("calendar");
         }
-        let mut st = self.inner.lock().await;
+        let mut st = self.inner.calendar.lock().await;
         json_result(
-            st.calendar
-                .update(
-                    &p.id,
-                    p.title.as_deref(),
-                    p.start.as_deref(),
-                    p.end.as_deref(),
-                    p.confirmation_token.as_deref(),
-                )
-                .await,
+            st.update(
+                &p.id,
+                p.title.as_deref(),
+                p.start.as_deref(),
+                p.end.as_deref(),
+                p.confirmation_token.as_deref(),
+            )
+            .await,
         )
     }
 
@@ -576,8 +590,8 @@ impl MacosServer {
         if !self.enabled.clipboard {
             return Self::disabled("clipboard");
         }
-        let st = self.inner.lock().await;
-        match st.clipboard.get() {
+        let st = self.inner.clipboard.lock().await;
+        match st.get() {
             Ok(text) => serde_json::json!({ "text": text }).to_string(),
             Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
         }
@@ -591,8 +605,8 @@ impl MacosServer {
         if !self.enabled.clipboard {
             return Self::disabled("clipboard");
         }
-        let st = self.inner.lock().await;
-        match st.clipboard.set(&p.text) {
+        let st = self.inner.clipboard.lock().await;
+        match st.set(&p.text) {
             Ok(()) => serde_json::json!({ "status": "set" }).to_string(),
             Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
         }
@@ -618,8 +632,8 @@ impl MacosServer {
 #[tool_handler(
     router = Self::tool_router(),
     name = "mcp-macos",
-    version = "0.1.3",
-    instructions = "Purpose-built Mail/Messages/Calendar/Notifications/Clipboard tools; prefer them over raw osascript/AppleScript. List/search results are summary-first metadata + snippet, never bodies — fetch full content by id with mail_read/messages_read. Paginated `offset`+`limit` (default 20, max 100). Sends and calendar writes are soft-gated: first call returns `requires_confirmation` + a single-use confirmation_token (5-min TTL); re-invoke with the token to execute. Reads, notifications, and clipboard are ungated. On permission errors, run `permissions_check` first. For status/history, consult the personai state directory before querying these apps. Mail access is selection-within-an-allowlist: mail_config reports the effective scope, and mail_search takes folders=[\"Account/Mailbox\", …] to pick any targets inside it per call. mail_forward/mail_reply send from the account owning the source message; a truncated:true search result means the scan hit its time budget and returned partial results (per-folder counts in scanned_per_folder)."
+    version = "0.1.4",
+    instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> mail_search then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
 )]
 impl rmcp::ServerHandler for MacosServer {
     async fn list_tools(
@@ -671,6 +685,17 @@ pub struct MailSearchParams {
     /// Page offset (default 0).
     #[serde(default)]
     pub offset: Option<u32>,
+    /// Aggregate instead of listing rows: "sender" groups by sender
+    /// address, "subject" by normalized subject (Re:/Fwd: stripped).
+    /// Returns {groups:[{key,name,count,first,last,latest_id,
+    /// sample_subjects,folders}]} paginated by count — use latest_id with
+    /// mail_read for the newest message of a group.
+    #[serde(default)]
+    pub group_by: Option<String>,
+    /// Body previews per row (default true). false renders pages much
+    /// faster; pair with mail_read for the rows you actually open.
+    #[serde(default)]
+    pub include_snippets: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -684,6 +709,10 @@ pub struct MailMailboxesParams {
 pub struct MailReadParams {
     /// Message id from a mail_search result.
     pub id: String,
+    /// Optional "Account/Mailbox" (as tagged on the search row) to target
+    /// the mailbox directly; omit for inbox-first lookup with fallback.
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]

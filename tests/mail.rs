@@ -1,6 +1,6 @@
 //! Mail toolset contract tests. All run on every OS via `MockTransport`.
 
-use mcp_macos::mail::{MailTargets, MailToolset};
+use mcp_macos::mail::{MailGroupBy, MailTargets, MailToolset};
 use personai_core::macos::MockTransport;
 use personai_core::safety::SoftGate;
 use serde_json::json;
@@ -45,7 +45,7 @@ async fn search_returns_metadata_only_and_paginates() {
     let env = format!(r#"{{"ok":true,"value":{mailbox}}}"#);
     let mut f = fixture(&[&env]);
     let res =
-        f.ts.search("application", None, None, None, Some(2), 0)
+        f.ts.search("application", None, None, None, Some(2), 0, true)
             .await
             .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
@@ -70,6 +70,7 @@ async fn search_escapes_user_text_into_script() {
             None,
             None,
             0,
+            true,
         )
         .await
         .unwrap();
@@ -87,7 +88,7 @@ async fn search_escapes_user_text_into_script() {
 #[tokio::test]
 async fn read_returns_full_message() {
     let mut f = fixture(&[r#"{"ok":true,"value":{"id":"m1","subject":"s","body":"full body"}}"#]);
-    let res = f.ts.read("m1").await.unwrap();
+    let res = f.ts.read("m1", None).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     assert_eq!(v["body"], "full body");
 }
@@ -180,14 +181,17 @@ async fn real_mail_accounts_search_read() {
     let v: serde_json::Value = serde_json::from_str(&accounts).unwrap();
     assert!(v["accounts"].as_array().unwrap().len() >= 1);
 
-    let res = ts.search("a", None, None, None, Some(5), 0).await.unwrap();
+    let res = ts
+        .search("a", None, None, None, Some(5), 0, true)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     let results = v["results"].as_array().unwrap();
     assert!(v["total"].as_u64().unwrap() >= 1);
     assert!(results.iter().all(|r| r.get("body").is_none()));
 
     if let Some(id) = results[0]["id"].as_str() {
-        let full = ts.read(id).await.unwrap();
+        let full = ts.read(id, None).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&full).unwrap();
         assert!(v["body"].is_string());
     }
@@ -222,9 +226,17 @@ async fn list_mailboxes_returns_counts_and_respects_filter() {
 async fn search_targets_named_mailbox_when_given() {
     let mut f = fixture(&[r#"{"ok":true,"value":{"total":0,"results":[]}}"#]);
     let _ =
-        f.ts.search("x", Some("Google"), Some("Work".into()), None, None, 0)
-            .await
-            .unwrap();
+        f.ts.search(
+            "x",
+            Some("Google"),
+            Some("Work".into()),
+            None,
+            None,
+            0,
+            true,
+        )
+        .await
+        .unwrap();
     let script = &f.ts.transport.calls()[0].script;
     assert!(
         script.contains(r#""Work""#),
@@ -281,6 +293,8 @@ async fn search_multi_merges_folders_paginates_and_strips_bodies() {
             None,
             2,
             1,
+            None,
+            true,
         )
         .await
         .unwrap();
@@ -314,12 +328,45 @@ async fn search_multi_reports_truncation_passthrough() {
             None,
             50,
             0,
+            None,
+            true,
         )
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     assert_eq!(v["truncated"], true, "budget truncation is passed through");
     assert_eq!(v["total"], 7);
+}
+
+#[tokio::test]
+async fn search_multi_grouped_mode_passthrough_and_script_flags() {
+    // The real JXA aggregates in-script; the mock verifies the contract:
+    // groups pass through untouched and the flags reach the script.
+    let env = r#"{"ok":true,"value":{"total":9,"total_groups":3,"groups":[{"key":"noreply@mail.amazon.jobs","name":"Amazon","count":5,"first":"2026-01-29T00:00:00Z","last":"2026-08-06T00:00:00Z","latest_id":"30256","sample_subjects":["thank you for applying"],"folders":["Unified/Inbox"]}],"scanned_per_folder":{"Unified/Inbox":1000},"truncated":false}}"#;
+    let mut f = fixture(&[env]);
+    let res =
+        f.ts.search_multi(
+            &MailTargets::Unified,
+            "application",
+            None,
+            20,
+            0,
+            Some(MailGroupBy::Sender),
+            false,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert_eq!(v["total"], 9, "total counts matches, not groups");
+    assert_eq!(v["total_groups"], 3);
+    let groups = v["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["count"], 5);
+    assert_eq!(groups[0]["latest_id"], "30256");
+    assert!(groups[0].get("snippet").is_none());
+    assert_eq!(v["scanned_per_folder"]["Unified/Inbox"], 1000);
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(script.contains("const GROUP = 'sender';"), "{script}");
 }
 
 #[tokio::test]

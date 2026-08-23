@@ -7,7 +7,7 @@
 //! Context discipline: `search` returns metadata only (never bodies),
 //! paginated (`total`/`offset`/`limit`), capped at [`MAX_LIMIT`].
 
-use personai_core::macos::{AppleError, AppleTransport, run_jxa_json};
+use personai_core::macos::{AppleError, AppleTransport, run_jxa_json, wrap_jxa};
 use personai_core::safety::{GateOutcome, SoftGate};
 use serde_json::{Value, json};
 
@@ -29,6 +29,27 @@ pub enum MailTargets {
     Unified,
     /// Explicit `(account, mailbox)` pairs.
     Folders(Vec<(String, String)>),
+}
+/// Aggregation mode for [`MailToolset::search_multi`]: collapse matches
+/// into per-sender or per-normalized-subject groups instead of returning
+/// rows, so agents triage hundreds of hits in one page.
+#[derive(Clone, Debug)]
+pub enum MailGroupBy {
+    /// Group by sender email address (angle-bracket form) or raw sender.
+    Sender,
+    /// Group by normalized subject (casefold, strip Re:/Fwd: prefixes).
+    Subject,
+}
+
+impl MailGroupBy {
+    /// Parses the wire string accepted by `mail_search`'s `group_by`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "sender" => Some(Self::Sender),
+            "subject" => Some(Self::Subject),
+            _ => None,
+        }
+    }
 }
 
 impl<T: AppleTransport> MailToolset<T> {
@@ -91,8 +112,32 @@ impl<T: AppleTransport> MailToolset<T> {
     /// like Work/Important are separate mailboxes outside the inbox.
     pub async fn list_mailboxes(&mut self, account: Option<String>) -> Result<String, AppleError> {
         let v = run_jxa_json(&mut self.transport, &mailboxes_expr(account.as_deref())).await?;
-        Ok(v.to_string())
+        let matched = account.is_none()
+            || v.get("mailboxes")
+                .and_then(Value::as_array)
+                .is_some_and(|a| !a.is_empty());
+        if matched {
+            return Ok(v.to_string());
+        }
+        // A silent [] for an unknown account sends agents guessing names;
+        // echo the valid ones so the next call self-corrects.
+        let accounts = run_jxa_json(
+            &mut self.transport,
+            "(() => { const M = Application('Mail'); return M.accounts().map(a => a.name()); })()",
+        )
+        .await?;
+        let asked = account.as_deref().unwrap_or("");
+        Ok(json!({
+            "mailboxes": [],
+            "note": format!(
+                "no mailboxes matched account {:?} — use one of available_accounts",
+                asked
+            ),
+            "available_accounts": accounts,
+        })
+        .to_string())
     }
+
     /// Lists mailboxes with counts plus each box's most recent activity
     /// (`last_activity` ISO timestamp or null, best-effort) so agents can
     /// pick live, active folders without opening Mail.
@@ -119,14 +164,20 @@ impl<T: AppleTransport> MailToolset<T> {
         since: Option<&str>,
         limit: Option<u32>,
         offset: u32,
+        snippets: bool,
     ) -> Result<String, AppleError> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        let v = run_jxa_json(
-            &mut self.transport,
-            &search_expr(query, account, mailbox.as_deref(), since, limit, offset),
-        )
-        .await?;
-
+        let v = self
+            .run_search_json(&search_expr(
+                query,
+                account,
+                mailbox.as_deref(),
+                since,
+                limit,
+                offset,
+                snippets,
+            ))
+            .await?;
         let total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as u32;
         let mut results = v
             .get("results")
@@ -154,10 +205,17 @@ impl<T: AppleTransport> MailToolset<T> {
     /// Searches one or more targets with a SINGLE script and merges the
     /// matches date-descending. A wall-clock budget ([`GLOBAL_BUDGET_MS`])
     /// is checked between targets: expiry stops the sweep early and
-    /// `truncated: true` reports the partial coverage. Payload:
+    /// `truncated: true` reports the partial coverage.
+    ///
+    /// Row mode (default) payload:
     /// `{total, offset, limit, results, scanned_per_folder, truncated}`
     /// where each result carries its `folder` tag (`"Account/Mailbox"`).
-    /// Metadata only — never bodies.
+    /// With `group`, rows collapse into
+    /// `{total, total_groups, offset, limit, groups, scanned_per_folder,
+    /// truncated}` where each group carries `key, name, count, first,
+    /// last, latest_id, sample_subjects, folders`. Metadata only — never
+    /// bodies; `snippets = false` skips per-row body previews entirely
+    /// (they cost one Apple Event each).
     pub async fn search_multi(
         &mut self,
         targets: &MailTargets,
@@ -165,14 +223,36 @@ impl<T: AppleTransport> MailToolset<T> {
         since: Option<&str>,
         limit: u32,
         offset: u32,
+        group: Option<MailGroupBy>,
+        snippets: bool,
     ) -> Result<String, AppleError> {
-        let v = run_jxa_json(
-            &mut self.transport,
-            &search_multi_expr(targets, query, since, limit, offset),
-        )
-        .await?;
+        let v = self
+            .run_search_json(&search_multi_expr(
+                targets, query, since, limit, offset, group, snippets,
+            ))
+            .await?;
 
         let total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let scanned = v
+            .get("scanned_per_folder")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let truncated = v.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+        if let Some(groups) = v.get("groups").cloned() {
+            return Ok(json!({
+                "total": total,
+                "total_groups": v
+                    .get("total_groups")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                "offset": offset,
+                "limit": limit,
+                "groups": groups,
+                "scanned_per_folder": scanned,
+                "truncated": truncated,
+            })
+            .to_string());
+        }
         let mut results = v
             .get("results")
             .and_then(Value::as_array)
@@ -192,21 +272,19 @@ impl<T: AppleTransport> MailToolset<T> {
             "offset": offset,
             "limit": limit,
             "results": results,
-            "scanned_per_folder": v
-                .get("scanned_per_folder")
-                .cloned()
-                .unwrap_or_else(|| json!({})),
-            "truncated": v
-                .get("truncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            "scanned_per_folder": scanned,
+            "truncated": truncated,
         })
         .to_string())
     }
 
-    /// Reads one full message by id (from `search` results).
-    pub async fn read(&mut self, id: &str) -> Result<String, AppleError> {
-        let v = run_jxa_json(&mut self.transport, &read_expr(id)).await?;
+    /// Reads one full message by id (from `search` results). `folder`
+    /// (`"Account/Mailbox"`, as tagged on the search row) targets the
+    /// mailbox directly; without it the inbox is tried first, then a
+    /// bounded per-mailbox sweep. Bodies are capped at [`READ_MAX_CHARS`]
+    /// with `body_truncated: true`.
+    pub async fn read(&mut self, id: &str, folder: Option<&str>) -> Result<String, AppleError> {
+        let v = run_jxa_json(&mut self.transport, &read_expr(id, folder)).await?;
         Ok(v.to_string())
     }
 
@@ -306,10 +384,44 @@ impl<T: AppleTransport> MailToolset<T> {
 /// and times out on real mailboxes.
 const SCAN_MAX: u32 = 1000;
 
-/// Wall-clock budget for [`MailToolset::search_multi`], checked inside the
-/// JXA loop between targets; expiry yields a partial result with
-/// `truncated: true` instead of an error.
+/// Wall-clock budget for searches, checked between [`MailTargets`] AND
+/// inside the page-rendering loop; expiry yields a partial result with
+/// `truncated: true` instead of exceeding the transport's 30 s osascript
+/// kill window.
 const GLOBAL_BUDGET_MS: u64 = 25_000;
+/// Subprocess leash for search scripts. They self-terminate at
+/// [`GLOBAL_BUDGET_MS`]; this only covers the case where bulk Apple Events
+/// on a huge mailbox (Gmail-scale unified inbox) burn through the budget
+/// before any check point — better a late partial page than a killed child.
+const SEARCH_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Hard cap on `mail_read` body text. Full MIME dumps (newsletters,
+/// base64 attachments) are context bombs for agent clients; callers who
+/// need more than this should quote the source email instead.
+const READ_MAX_CHARS: usize = 20_000;
+impl<T: AppleTransport> MailToolset<T> {
+    /// [`personai_core::macos::run_jxa_json`] with a longer leash: same
+    /// `{"ok":true,"value"|"error":{number,desc}}` envelope contract, but
+    /// search scripts get [`SEARCH_LEASE`] instead of the fixed 30 s kill.
+    async fn run_search_json(&mut self, expr: &str) -> Result<Value, AppleError> {
+        let raw = self.transport.run(&wrap_jxa(expr), SEARCH_LEASE).await?;
+        let v: Value =
+            serde_json::from_str(raw.trim()).map_err(|e| AppleError::Parse(e.to_string()))?;
+        match v.get("ok") {
+            Some(Value::Bool(true)) => Ok(v.get("value").cloned().unwrap_or(Value::Null)),
+            _ => {
+                let e = v.get("error").cloned().unwrap_or(Value::Null);
+                Err(AppleError::AppleEvent {
+                    number: e.get("number").and_then(|n| n.as_i64()).unwrap_or(-1),
+                    desc: e
+                        .get("desc")
+                        .and_then(|d| d.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            }
+        }
+    }
+}
 
 fn search_expr(
     query: &str,
@@ -318,6 +430,7 @@ fn search_expr(
     since: Option<&str>,
     limit: u32,
     offset: u32,
+    snippets: bool,
 ) -> String {
     let q = js_str(&query.to_lowercase());
     // Default: the unified inbox (all accounts). `account` narrows to that
@@ -351,6 +464,9 @@ fn search_expr(
   const M = Application('Mail');
   {account_clause}
   {since_clause}
+  const BUDGET_MS = {GLOBAL_BUDGET_MS};
+  const t0 = Date.now();
+  let timedOut = false;
   const scan = Math.min(box.messages.length, {SCAN_MAX});
   const ids = box.messages.id().slice(0, scan);
   const subjects = box.messages.subject().slice(0, scan);
@@ -367,10 +483,11 @@ fn search_expr(
   const end = Math.min({offset} + {limit}, total);
   const out = [];
   for (let k = {offset}; k < end; k++) {{
+    if (Date.now() - t0 > BUDGET_MS) {{ timedOut = true; break; }}
     const i = idx[k];
     const m = box.messages[i];
     let snippet = '';
-    try {{ snippet = String(m.content()).slice(0, 140); }} catch (e) {{}}
+    if ({snippets}) {{ try {{ snippet = String(m.content()).slice(0, 140); }} catch (e) {{}} }}
     out.push({{
       id: String(ids[i]),
       subject: subjects[i],
@@ -379,7 +496,7 @@ fn search_expr(
       snippet: snippet,
     }});
   }}
-  return {{total: total, results: out}};
+  return {{total: total, results: out, truncated: timedOut}};
 }})()"#
     )
 }
@@ -397,6 +514,8 @@ fn search_multi_expr(
     since: Option<&str>,
     limit: u32,
     offset: u32,
+    group: Option<MailGroupBy>,
+    snippets: bool,
 ) -> String {
     let q = js_str(&query.to_lowercase());
     let since_clause = match since {
@@ -413,11 +532,18 @@ fn search_multi_expr(
             format!("[{}]", items.join(", "))
         }
     };
+    let group_js = match group {
+        Some(MailGroupBy::Sender) => "'sender'",
+        Some(MailGroupBy::Subject) => "'subject'",
+        None => "''",
+    };
     format!(
         r#"(() => {{
   const M = Application('Mail');
   const BUDGET_MS = {GLOBAL_BUDGET_MS};
   const t0 = Date.now();
+  const GROUP = {group_js};
+  const SNIPPETS = {snippets};
   {since_clause}
   const qLower = {q};
   const targets = {targets_js};
@@ -461,12 +587,52 @@ fn search_multi_expr(
   }}
   merged.sort((x, y) => y.ms - x.ms);
   const total = merged.length;
+  if (GROUP !== '') {{
+    const normSub = s => String(s == null ? '' : s).toLowerCase().replace(/^(\s*(re|fwd?|fw)\s*(\[\d+\])?\s*:\s*)+/, '').replace(/\s+/g, ' ').trim();
+    const addrOf = f => {{ const m = /<([^>]+)>/.exec(String(f || '')); return m ? m[1].trim().toLowerCase() : String(f || '').trim().toLowerCase(); }};
+    const nameOf = f => {{ const a = addrOf(f); const m = /^\s*"?([^"<]+?)"?\s*</.exec(String(f || '')); return (m ? m[1].trim() : '') || a; }};
+    const map = new Map();
+    for (const e of merged) {{
+      const key = GROUP === 'sender' ? addrOf(e.from) : normSub(e.subject);
+      let g = map.get(key);
+      if (!g) {{
+        g = {{ key: key, name: nameOf(e.from), count: 0, first_ms: e.ms, first: e.date, last_ms: e.ms, last: e.date, latest_id: e.id, samples: [], folders: [] }};
+        map.set(key, g);
+      }}
+      g.count++;
+      if (e.ms < g.first_ms) {{ g.first_ms = e.ms; g.first = e.date; }}
+      if (e.ms > g.last_ms) {{ g.last_ms = e.ms; g.last = e.date; g.latest_id = e.id; }}
+      const ns = normSub(e.subject);
+      if (g.samples.length < 2 && !g.samples.some(x => normSub(x) === ns)) g.samples.push(String(e.subject == null ? '' : e.subject));
+      if (g.folders.length < 3 && !g.folders.includes(e.folder)) g.folders.push(e.folder);
+    }}
+    let allGroups = Array.from(map.values());
+    allGroups.sort((a, b) => (b.count - a.count) || (b.last_ms - a.last_ms));
+    const totalGroups = allGroups.length;
+    const endG = Math.min({offset} + {limit}, totalGroups);
+    const page = [];
+    for (let k2 = {offset}; k2 < endG; k2++) {{
+      const g = allGroups[k2];
+      page.push({{
+        key: g.key,
+        name: GROUP === 'sender' ? g.name : g.key,
+        count: g.count,
+        first: g.first,
+        last: g.last,
+        latest_id: g.latest_id,
+        sample_subjects: g.samples,
+        folders: g.folders,
+      }});
+    }}
+    return {{total: total, total_groups: totalGroups, offset: {offset}, limit: {limit}, groups: page, scanned_per_folder: scannedPerFolder, truncated: truncated}};
+  }}
   const end = Math.min({offset} + {limit}, total);
   const out = [];
   for (let k = {offset}; k < end; k++) {{
+    if (Date.now() - t0 > BUDGET_MS) {{ truncated = true; break; }}
     const e = merged[k];
     let snippet = '';
-    try {{ snippet = String(e.ref.content()).slice(0, 140); }} catch (err) {{}}
+    if (SNIPPETS) {{ try {{ snippet = String(e.ref.content()).slice(0, 140); }} catch (err) {{}} }}
     out.push({{
       id: e.id,
       subject: e.subject,
@@ -551,23 +717,64 @@ fn mailboxes_detailed_expr(account: Option<&str>) -> String {
     )
 }
 
-fn read_expr(id: &str) -> String {
+fn read_expr(id: &str, folder: Option<&str>) -> String {
     let id = js_str(id);
+    // `folder` ("Account/Mailbox", as tagged on search rows) targets the
+    // mailbox directly — one whose() per lookup. Without it: inbox first
+    // (the common case), then a bounded sweep across every mailbox with
+    // early exit on the first hit.
+    let locate = match folder {
+        Some(f) => match f.rsplit_once('/') {
+            Some((a, b)) => format!(
+                "const box = (() => {{ const acc = M.accounts.whose({{name: {}}})()[0]; \
+                 if (!acc) throw new Error('account not found: {}'); \
+                 return acc.mailboxes.whose({{name: {}}})()[0]; }})();",
+                js_str(a),
+                js_str(a),
+                js_str(b)
+            ),
+            None => String::new(),
+        },
+        None => String::new(),
+    };
     format!(
         r#"(() => {{
   const M = Application('Mail');
   const wanted = Number({id});
-  const hits = M.inbox().messages.whose({{id: wanted}});
-  if (hits.length === 0) throw new Error('message not found: ' + {id});
-  const m = hits[0];
+  const READ_MAX_CHARS = {READ_MAX_CHARS};
+  const pick = (box) => {{
+    const hits = box.messages.whose({{id: wanted}});
+    return hits.length > 0 ? hits[0] : null;
+  }};
+  let m = null;
+  {locate}
+  if (typeof box !== 'undefined') {{
+    m = pick(box);
+    if (!m) throw new Error('message not found in folder: ' + {id});
+  }} else {{
+    m = pick(M.inbox());
+    if (!m) {{
+      outer: for (const acc of M.accounts() || []) {{
+        const mbs = acc.mailboxes() || [];
+        for (const mb of mbs) {{
+          m = pick(mb);
+          if (m) break outer;
+        }}
+      }}
+    }}
+    if (!m) throw new Error('message not found: ' + {id});
+  }}
   let body = '';
   try {{ body = String(m.content()); }} catch (e) {{}}
+  const truncated = body.length > READ_MAX_CHARS;
+  if (truncated) body = body.slice(0, READ_MAX_CHARS);
   return {{
     id: String(m.id()),
     subject: m.subject(),
     from: m.sender(),
     date: m.dateReceived().toISOString(),
     body: body,
+    body_truncated: truncated,
   }};
 }})()"#
     )
@@ -660,7 +867,7 @@ mod tests {
 
     #[test]
     fn search_builder_escapes_user_text() {
-        let s = search_expr("O'Brien \"x\"", Some("work"), None, None, 20, 0);
+        let s = search_expr("O'Brien \"x\"", Some("work"), None, None, 20, 0, true);
         assert!(s.contains(r#""o'brien \"x\"""#), "{s}");
         assert!(s.contains(r#"{name: "work"}"#), "{s}");
     }
@@ -675,6 +882,8 @@ mod tests {
             Some("2026-08-01T00:00:00Z"),
             20,
             40,
+            None,
+            true,
         );
         // Folder pairs are escaped verbatim (only the query is lowercased).
         assert!(s.contains(r#"{a: "Wörk \"1\"", b: "Box\\A"}"#), "{s}");
@@ -685,7 +894,7 @@ mod tests {
         // Query is lowercased then escaped like search_expr.
         assert!(s.contains(r#""o'brien""#), "{s}");
 
-        let u = search_multi_expr(&MailTargets::Unified, "x", None, 10, 0);
+        let u = search_multi_expr(&MailTargets::Unified, "x", None, 10, 0, None, true);
         assert!(u.contains("const targets = [{u: true}];"), "{u}");
         assert!(u.contains("'Unified/Inbox'"), "{u}");
     }

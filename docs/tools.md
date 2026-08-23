@@ -51,8 +51,11 @@ not in the inbox). Scan window: newest 1000 messages (`SCAN_MAX` in
 | account | string? | restrict to one account (its inbox) |
 | mailbox | string? | target this named mailbox within `account` |
 | since | ISO 8601 string? | only messages received after this instant |
-| limit | u32? | page size, default 20, hard max 100 |
+| folders | string[]? | `["Account/Mailbox", …]` targets, validated against the scope |
+| limit | u32? | page size, default 20, hard max 100 — prefer small pages |
 | offset | u32? | default 0 |
+| group_by | "sender"\|"subject"? | aggregate rows into `{groups:[{key,name,count,first,last,latest_id,sample_subjects,folders}]}` ordered by count; subject mode strips Re:/Fwd: chains |
+| include_snippets | bool? | default true; `false` skips body previews for much faster pages |
 
 ```json
 {"total": 3, "offset": 0, "limit": 2, "results": [
@@ -61,13 +64,19 @@ not in the inbox). Scan window: newest 1000 messages (`SCAN_MAX` in
 ]}
 ```
 
+Grouped responses replace `results` with `groups` and add
+`total_groups`; follow up with `mail_read(latest_id)`.
+
 ### mail_read — auto
 
-Read one full message by `id` from a search result.
+Read one full message by `id` from a search result. Pass the row's
+`folder` tag to target its mailbox directly; without it the inbox is
+tried first, then every mailbox. Bodies are capped at 20 000 chars.
 
 ```json
 {"id": "30575", "subject": "…", "from": "…",
- "date": "2026-08-21T16:01:33Z", "body": "full plain-text body"}
+ "date": "2026-08-21T16:01:33Z", "body": "plain-text body",
+ "body_truncated": false}
 ```
 
 ### mail_send — soft-gated
