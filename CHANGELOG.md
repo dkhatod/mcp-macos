@@ -3,7 +3,7 @@
 All notable changes. Format follows [Keep a Changelog](https://keepachangelog.com);
 versions are semver (0.x: breaking changes bump minor).
 
-## [0.2.0] — 2026-08-23
+## [0.1.5] — 2026-08-23
 
 ### Added
 - Match-all census: `query` is now optional — omitting it (with

@@ -699,10 +699,11 @@ impl MacosServer {
 
 /// The ServerHandler impl. `#[tool_handler]` generates `call_tool` /
 /// `get_tool` / `get_info` from the router; `list_tools` is written by hand
+/// below.
 #[tool_handler(
     router = Self::tool_router(),
     name = "mcp-macos",
-    version = "0.2.0",
+    version = "0.1.5",
     instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> mail_search then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
 )]
 impl rmcp::ServerHandler for MacosServer {
