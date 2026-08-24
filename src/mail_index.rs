@@ -595,3 +595,83 @@ pub fn search_index(h: &IndexHandle, q: &IndexQuery) -> Result<String, IndexErro
         }
     }
 }
+
+/// Fetch a cached body envelope (`subject`,`sender`,`date_iso`,`body`,
+/// `body_truncated`) or None.
+pub fn cache_get(h: &IndexHandle, key: &str) -> Result<Option<Value>, IndexError> {
+    let mut rows = h.query(
+        "SELECT subject, sender, date_iso, body, body_truncated \
+         FROM mail_bodies WHERE cache_key = ?1",
+        &[json!(key)],
+    )?;
+    match rows.pop() {
+        Some(mut v) => {
+            if let Some(o) = v.as_object_mut() {
+                let flag = o.get("body_truncated").and_then(Value::as_i64).unwrap_or(0) != 0;
+                o.insert("body_truncated".into(), json!(flag));
+            }
+            Ok(Some(v))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Store a body under `key` ("Account/Mailbox|id" or "?|id").
+#[allow(clippy::too_many_arguments)]
+pub fn cache_put(
+    h: &IndexHandle,
+    key: &str,
+    subject: &str,
+    sender: &str,
+    date_iso: &str,
+    body: &str,
+    truncated: bool,
+) -> Result<(), IndexError> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    h.upsert(
+        "mail_bodies",
+        &[
+            "cache_key",
+            "subject",
+            "sender",
+            "date_iso",
+            "body",
+            "body_truncated",
+            "fetched_at",
+        ],
+        &["cache_key"],
+        &[json!({
+            "cache_key": key, "subject": subject, "sender": sender,
+            "date_iso": date_iso, "body": body,
+            "body_truncated": truncated as i64, "fetched_at": now,
+        })],
+    )?;
+    Ok(())
+}
+
+/// Evict oldest bodies until total stored bytes fit `cap_bytes`.
+pub fn prune_bodies(h: &IndexHandle, cap_bytes: u64) -> Result<(), IndexError> {
+    // Rare maintenance path: evict strictly oldest-first, one row per pass,
+    // until the stored total fits. Exact — never overshoots the cap.
+    loop {
+        let total = h
+            .query(
+                "SELECT COALESCE(SUM(LENGTH(body)), 0) AS n FROM mail_bodies",
+                &[],
+            )?
+            .remove(0)["n"]
+            .as_i64()
+            .unwrap_or(0);
+        if total <= cap_bytes as i64 {
+            return Ok(());
+        }
+        h.query(
+            "DELETE FROM mail_bodies WHERE cache_key = (
+               SELECT cache_key FROM mail_bodies ORDER BY fetched_at ASC LIMIT 1)",
+            &[],
+        )?;
+    }
+}

@@ -948,6 +948,61 @@ fn send_expr(to: &str, subject: &str, body: &str, from: Option<&str>) -> String 
     )
 }
 
+impl<T: AppleTransport> MailToolset<T> {
+    /// Cached read: serve from `mail_bodies` when present (adds
+    /// `"cached":true`, zero transport cost), else live read + write-through.
+    pub async fn read_cached(
+        &mut self,
+        id: &str,
+        folder: Option<&str>,
+        h: &personai_core::index::IndexHandle,
+    ) -> Result<String, AppleError> {
+        use crate::mail_index::{cache_get, cache_put};
+        let index_err = |e: personai_core::index::IndexError| AppleError::Transport(e.to_string());
+        let key = format!("{}|{id}", folder.unwrap_or("?"));
+        if let Some(hit) = cache_get(h, &key).map_err(index_err)? {
+            let mut v = hit;
+            if let Some(o) = v.as_object_mut() {
+                o.insert("cached".into(), serde_json::json!(true));
+                o.entry("id".to_string())
+                    .or_insert_with(|| serde_json::json!(id));
+                o.entry("subject".to_string())
+                    .or_insert_with(|| serde_json::json!(""));
+                o.entry("from".to_string())
+                    .or_insert_with(|| serde_json::json!(""));
+                o.entry("date".to_string())
+                    .or_insert_with(|| serde_json::json!(""));
+                if let Some(t) = o.get_mut("body_truncated") {
+                    let flag = t.as_i64().unwrap_or(0) != 0;
+                    *t = serde_json::json!(flag);
+                }
+                o.remove("date_iso");
+            }
+            return Ok(v.to_string());
+        }
+        // Miss: live read, then write-through so repeat reads are free.
+        let out = self.read(id, folder).await?;
+        let parsed: Value = serde_json::from_str(&out)
+            .map_err(|e| AppleError::Transport(format!("unreadable read payload: {e}")))?;
+        cache_put(
+            h,
+            &key,
+            parsed["subject"].as_str().unwrap_or_default(),
+            parsed["from"].as_str().unwrap_or_default(),
+            parsed["date"].as_str().unwrap_or_default(),
+            parsed["body"].as_str().unwrap_or_default(),
+            parsed["body_truncated"].as_bool().unwrap_or(false),
+        )
+        .map_err(index_err)?;
+        // Flag honestly without a second DB round-trip or async recursion.
+        let mut out_v = parsed;
+        if let Some(o) = out_v.as_object_mut() {
+            o.insert("cached".into(), serde_json::json!(true));
+        }
+        Ok(out_v.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
