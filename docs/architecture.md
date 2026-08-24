@@ -165,6 +165,25 @@ Soft-gated tools: `mail_send`, `messages_send`, `calendar_create`,
 - `ToolAnnotations` (read_only/destructive hints) are advisory metadata for
   clients; the gates above are the enforcement.
 
+## 5b. The index layer (0.1.8)
+
+`mail_sync` + `mail_search(source:"index")` add a local corpus cache over
+one SQLite file (`state_dir/index.db`). Responsibilities are split:
+
+- `personai-core::index` (generic engine): migrations via `PRAGMA
+  user_version`, per-scope watermarks (`sync_state`), transactional
+  upsert / partition-replace, raw JSON-typed queries. Knows nothing about
+  mail; Messages/Calendar can reuse it unchanged.
+- `src/mail_index.rs` (surface): the mail schema (`mail_messages` +
+  FTS5 external-content mirror kept consistent by triggers,
+  `mail_bodies` body cache), fingerprint hashing to detect Apple-id reuse,
+  and the per-folder sync scripts. One osascript run per folder keeps every
+  commit independent — an interrupted sweep resumes with no partial state.
+
+Index-mode search executes filters/grouping as SQL: no Apple Events, no
+25 s budget; responses carry `data_as_of` (the watermark) instead of
+pretending freshness.
+
 ## 6. Performance characteristics
 
 Measured on an M-series Mac, 22k-message Gmail inbox, 25 calendars:

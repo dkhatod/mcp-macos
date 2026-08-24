@@ -5,6 +5,33 @@ versions are semver (0.x: breaking changes bump minor).
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-08-24
+
+### Added
+- **Local mail index** (`state_dir/index.db`, via personai-core 0.2's new
+  generic index engine): `mail_sync` pulls message metadata per folder with
+  independent commits and date watermarks (1 h clock-skew buffer);
+  fingerprint mismatches surface Apple-id reuse. Full mode replaces folder
+  partitions wholesale.
+- **`mail_search(source: "index")`**: term/folder/date filters, sender and
+  subject grouping, and pagination run as local SQL instead of ~210 Apple
+  Events per sweep — responses carry `data_as_of`. Default stays `"live"`;
+  behavior of existing callers is unchanged.
+- **Body cache**: `mail_read` writes through to `mail_bodies`; repeat reads
+  are served from disk (`"cached": true`). Pruned to ~200 MB, oldest first.
+- FTS5 external-content mirror over subjects/senders maintained by
+  triggers (ready for full-text queries; not yet exposed as a tool).
+
+### Changed
+- `mcp-macos` now links personai-core as a local path dependency
+  (`../personai-core`) until the first crates.io publish.
+
+### Performance (targets; measured at live acceptance)
+- Sender census over the whole scope: budget-bound ~25 s live call →
+  < 50 ms indexed.
+- Delta re-sync after a typical day: < 10 s.
+- Repeat `mail_read`: ~0.5–2 s → < 5 ms.
+
 ### Fixed
 - Regression: a grouped-return refactor dropped the for-loop closer and the
   folder provenance field from generated search scripts, breaking every

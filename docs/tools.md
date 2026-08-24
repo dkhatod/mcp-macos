@@ -37,6 +37,30 @@ Personal, Important…) are mailboxes *outside* the inbox — call this before
 ]}
 ```
 
+### mail_sync — auto
+
+Refresh the local mail index (`state_dir/index.db`) from Mail.app. One
+osascript run **per folder** (independent commits ⇒ resumable mid-sweep);
+incremental by default — only messages newer than the folder's watermark
+minus a 1 h buffer are fetched. `full: true` re-reads whole folders and
+replaces their cached rows (fixes moved/deleted drift).
+
+```json
+{"synced_per_folder": {"Exchange/Apps": {"scanned": 164, "new": 2,
+  "updated": 1, "mismatches": 0}},
+ "data_as_of": "2026-08-24T12:00:00.000Z", "duration_ms": 4210}
+```
+
+| Param | Type | Notes |
+|---|---|---|
+| folders | string[]? | `["Account/Mailbox", …]` or `["*"]` = every scoped folder; default = every scoped folder |
+| account | string? | keep only that account's folders |
+| full | bool? | ignore watermarks, replace partitions wholesale |
+| scan_limit | u32? | per-mailbox scan depth, default 5000 |
+
+Run it once per session before index-mode searches; repeat syncs cost
+O(new mail), typically seconds.
+
 ### mail_search — auto
 
 Returns metadata **only** — never bodies. By default searches the **unified
@@ -56,6 +80,7 @@ not in the inbox). Scan window: newest 1000 messages (`SCAN_MAX` in
 | offset | u32? | default 0 |
 | group_by | "sender"\|"subject"? | aggregate rows into `{groups:[{key,name,count,first,last,latest_id,sample_subjects,folders}]}` ordered by count; subject mode strips Re:/Fwd: chains |
 | include_snippets | bool? | default true; `false` skips body previews for much faster pages |
+| source | "live"\|"index"? | default `"live"` (Mail.app Apple Events, 25 s budget). `"index"` queries the local corpus cache from mail_sync instead — instant, no budget; the response carries `data_as_of` so you can judge staleness |
 
 ```json
 {"total": 3, "results": [
@@ -78,6 +103,10 @@ tried first, then every mailbox. Bodies are capped at 20 000 chars.
  "date": "2026-08-21T16:01:33Z", "body": "plain-text body",
  "body_truncated": false}
 ```
+
+Bodies are cached in `mail_bodies` on first read: a repeat read of the same
+message is served from disk and carries `"cached": true`. Cache size is
+pruned to ~200 MB (oldest evicted first).
 
 ### mail_send — soft-gated
 

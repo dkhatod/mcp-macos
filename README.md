@@ -78,7 +78,9 @@ $ cargo install mcp-macos        # or download a release binary
 | `mail_list_accounts` | List accounts with identity details (email, type) | auto |
 | `mail_list_mailboxes` | List mailboxes per account with counts | auto |
 | `mail_search` | Search message metadata (never bodies) across all accounts by default; optional account/mailbox narrowing; `group_by="sender"/"subject"` aggregates rows into counts with `latest_id` for triage; `include_snippets=false` for fast pages | auto |
-| `mail_read` | Read one full message by id | auto |
+| `mail_sync` | Refresh the local mail index (`state_dir/index.db`) incrementally (watermarked) or in full; per-folder commits, resumable | auto |
+| `mail_search` | Search message metadata (never bodies) across all accounts by default; optional account/mailbox narrowing; `group_by="sender"/"subject"` aggregates rows into counts with `latest_id` for triage; `source:"index"` queries the local cache instantly (`data_as_of` freshness marker) | auto |
+| `mail_read` | Read one full message by id — bodies cached on first read (`"cached": true`) | auto |
 | `mail_send` | Send email | soft-gated |
 | `messages_chats` | List chats (identifier, name, service, handle, last activity) for send addressing | auto |
 | `messages_read` | Read iMessage/SMS history from chat.db | auto |
