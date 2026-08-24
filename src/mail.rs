@@ -706,6 +706,7 @@ fn search_multi_expr(
         sample_subjects: g.samples,
         folders: g.folders,
       }});
+    }}
     const ret = {{total: total, total_groups: totalGroups, groups: page, scanned_per_folder: scannedPerFolder}};
     if (truncated) ret.truncated = true;
     return ret;

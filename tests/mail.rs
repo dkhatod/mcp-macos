@@ -669,3 +669,34 @@ async fn snippets_center_on_first_matching_term() {
         "window must back up before the hit: {script}"
     );
 }
+
+/// Counts parens/braces outside string literals; guards against the class
+/// of regression where a format-template edit leaves a generated JXA
+/// script syntactically dead (every mail_search 500s at parse time).
+fn balanced(script: &str) -> bool {
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut escaped = false;
+    for c in script.chars() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '\'' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '\'' => in_str = true,
+            '{' | '(' => depth += 1,
+            '}' | ')' => depth -= 1,
+            _ => {}
+        }
+        if depth < 0 {
+            return false;
+        }
+    }
+    depth == 0
+}
