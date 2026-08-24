@@ -8,9 +8,10 @@
 //! Context discipline: `read` is paginated (`total`/`offset`/`limit`) and
 //! returns per-message metadata only.
 
-use personai_core::macos::{AppleError, AppleTransport, run_jxa_json};
+use personai_core::macos::{AppleError, AppleTransport, run_jxa_json, wrap_jxa};
 use personai_core::safety::{GateOutcome, SoftGate};
 use serde_json::json;
+use std::time::Duration;
 
 use crate::util::js_str;
 use crate::{DEFAULT_LIMIT, MAX_LIMIT};
@@ -50,12 +51,38 @@ impl<T: AppleTransport> MessagesToolset<T> {
         offset: u32,
     ) -> Result<String, AppleError> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
-        let v = run_jxa_json(
-            &mut self.transport,
-            &read_expr(chat.as_deref(), limit, offset),
-        )
-        .await?;
-        Ok(crate::util::unwrap_string_payload(v)?.to_string())
+        let expr = read_expr(chat.as_deref(), limit, offset);
+        match run_jxa_json(&mut self.transport, &expr).await {
+            Ok(v) => Ok(crate::util::unwrap_string_payload(v)?.to_string()),
+            Err(e @ AppleError::Parse(_)) => {
+                // Live-quirk diagnostic: dump the raw osascript stdout so
+                // the user can see what broke the single-line envelope.
+                // Zero-cost unless MCP_MACOS_DEBUG_RAW=1 is exported.
+                if matches!(std::env::var("MCP_MACOS_DEBUG_RAW").as_deref(), Ok("1")) {
+                    let raw = self
+                        .transport
+                        .run(&wrap_jxa(&expr), Duration::from_secs(30))
+                        .await;
+                    let raw = raw.unwrap_or_default();
+                    let chars: Vec<char> = raw.chars().collect();
+                    let head: String = chars.iter().take(500).collect();
+                    let tail: String = chars
+                        .iter()
+                        .rev()
+                        .take(300)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    eprintln!(
+                        "[MCP_MACOS_DEBUG_RAW] read failed ({e}); raw stdout length={}\nHEAD(500): {head}\nTAIL(300): {tail}",
+                        chars.len()
+                    );
+                }
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Lists chats (identifier, display name, service, sample handle,

@@ -131,6 +131,9 @@ Groups: `mail`, `messages`, `calendar`, `contacts`, `reminders`,
   doctor walks you through it).
 - **Full Disk Access** for the process running the server, for
   `messages_read` (it reads `~/Library/Messages/chat.db` via `sqlite3`).
+- **Troubleshooting** — `messages_read` parse errors ("trailing
+  characters"): re-run with `MCP_MACOS_DEBUG_RAW=1` and share the captured
+  HEAD/TAIL stderr dump.
 
 ## Output format note
 

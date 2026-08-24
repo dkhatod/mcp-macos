@@ -194,3 +194,48 @@ async fn generated_scripts_are_syntactically_balanced() {
         "send script unbalanced"
     );
 }
+
+/// MCP_MACOS_DEBUG_RAW diagnostic: with the env var set, an unparseable
+/// envelope triggers a second transport call that captures the raw stdout;
+/// without it, zero extra calls. The Parse error propagates either way.
+#[tokio::test]
+async fn debug_raw_recaptures_stdout_only_when_env_gated() {
+    // Deliberately multi-line stdout — mimics the live quirk where
+    // osascript prints extra lines around the JSON envelope.
+    let broken = "{\"ok\":true,\"value\":{\"total\":0}}\nstray line\n";
+
+    // Env unset (the production default): single call, no recapture.
+    unsafe {
+        std::env::remove_var("MCP_MACOS_DEBUG_RAW");
+    }
+    let mut t = MockTransport::new();
+    t.enqueue(broken);
+    let mut ts = MessagesToolset::new(t);
+    let err = ts.read(None, None, 0).await.unwrap_err();
+    assert!(err.to_string().contains("trailing"), "{err}");
+    assert_eq!(ts.transport.calls().len(), 1, "no extra call when unset");
+
+    // Env set: same failure, but the raw stdout is re-captured.
+    unsafe {
+        std::env::set_var("MCP_MACOS_DEBUG_RAW", "1");
+    }
+    let mut t = MockTransport::new();
+    t.enqueue(broken);
+    t.enqueue(r#"{"ok":true,"value":{"total":0}}"#); // consumed by the recapture
+    let mut ts = MessagesToolset::new(t);
+    let err = ts.read(None, None, 0).await.unwrap_err();
+    assert!(
+        err.to_string().contains("trailing"),
+        "error must still propagate"
+    );
+    assert_eq!(ts.transport.calls().len(), 2, "diagnostic re-run expected");
+    assert!(
+        ts.transport.calls()[1]
+            .script
+            .contains("JSON.stringify({ok"),
+        "recapture must use the wrap_jxa envelope"
+    );
+    unsafe {
+        std::env::remove_var("MCP_MACOS_DEBUG_RAW");
+    }
+}
