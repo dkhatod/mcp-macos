@@ -1,5 +1,8 @@
 //! Contacts toolset contract tests. All run on every OS via `MockTransport`.
 
+mod common;
+
+use common::balanced;
 use mcp_macos::contacts::ContactsToolset;
 use personai_core::macos::MockTransport;
 use serde_json::Value;
@@ -50,4 +53,14 @@ async fn empty_query_is_census_mode_with_default_limit() {
         1,
         "one bulk-fetch script per call"
     );
+}
+
+/// Balance oracle over the generated Contacts script.
+#[tokio::test]
+async fn generated_script_is_syntactically_balanced() {
+    let env = r#"{"ok":true,"value":{"total":0,"contacts":[]}}"#;
+    let mut f = fixture(&[env]);
+    let _ = f.search("O'Brien", Some(5), 2).await.unwrap();
+    let script = &f.transport.calls()[0].script;
+    assert!(balanced(script), "search script unbalanced: {script}");
 }

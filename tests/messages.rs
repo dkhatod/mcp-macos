@@ -1,5 +1,8 @@
 //! Messages toolset contract tests (mock transport).
 
+mod common;
+
+use common::balanced;
 use mcp_macos::messages::MessagesToolset;
 use personai_core::macos::MockTransport;
 use personai_core::safety::SoftGate;
@@ -156,4 +159,38 @@ async fn chats_unwraps_preserialized_payload() {
     let v: serde_json::Value =
         serde_json::from_str(&f.ts.chats(Some(20), 0).await.unwrap()).unwrap();
     assert_eq!(v["chats"][0]["display_name"], "Mom");
+}
+
+/// Balance oracle over every generated Messages script.
+#[tokio::test]
+async fn generated_scripts_are_syntactically_balanced() {
+    // read_expr
+    let mut f = fixture(&[r#"{"ok":true,"value":{"total":0,"messages":[]}}"#]);
+    let _ = f.ts.read(None, None, 0).await.unwrap();
+    assert!(
+        balanced(&f.ts.transport.calls()[0].script),
+        "read script unbalanced"
+    );
+
+    // chats_expr
+    let mut g = fixture(&[r#"{"ok":true,"value":{"total":0,"chats":[]}}"#]);
+    let _ = g.ts.chats(None, 0).await.unwrap();
+    assert!(
+        balanced(&g.ts.transport.calls()[0].script),
+        "chats script unbalanced"
+    );
+
+    // send_expr (execute phase of the soft gate)
+    let mut h = fixture(&[r#"{"ok":true,"value":{"status":"sent"}}"#]);
+    let first = h.ts.send("+15550001111", "Hi!", None).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let token = v["confirmation_token"].as_str().unwrap().to_string();
+    let _ =
+        h.ts.send("+15550001111", "Hi!", Some(&token))
+            .await
+            .unwrap();
+    assert!(
+        balanced(&h.ts.transport.calls()[0].script),
+        "send script unbalanced"
+    );
 }

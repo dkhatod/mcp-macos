@@ -1,5 +1,8 @@
 //! Calendar toolset contract tests (mock transport).
 
+mod common;
+
+use common::balanced;
 use mcp_macos::calendar::CalendarToolset;
 use personai_core::macos::MockTransport;
 use personai_core::safety::SoftGate;
@@ -186,6 +189,87 @@ async fn create_targets_named_calendar_with_location() {
         "named calendar targeted: {script}"
     );
     assert!(script.contains(r#"location: "Room 4""#), "{script}");
+}
+
+/// Balance oracle over every generated Calendar script.
+#[tokio::test]
+async fn generated_scripts_are_syntactically_balanced() {
+    // read_expr
+    let mut a = fixture(&[r#"{"ok":true,"value":{"total":0,"events":[]}}"#]);
+    let _ = a.ts.read(None, None, None, 0).await.unwrap();
+    assert!(
+        balanced(&a.ts.transport.calls()[0].script),
+        "read script unbalanced"
+    );
+
+    // create_expr (execute phase of the soft gate)
+    let mut b = fixture(&[r#"{"ok":true,"value":{"id":"e2","calendar":"Work"}}"#]);
+    let first =
+        b.ts.create(
+            "Interview",
+            "2026-08-25T09:00:00Z",
+            "2026-08-25T10:00:00Z",
+            Some("Work"),
+            Some("Room 4"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let token = v["confirmation_token"].as_str().unwrap().to_string();
+    let _ =
+        b.ts.create(
+            "Interview",
+            "2026-08-25T09:00:00Z",
+            "2026-08-25T10:00:00Z",
+            Some("Work"),
+            Some("Room 4"),
+            None,
+            Some(&token),
+        )
+        .await
+        .unwrap();
+    assert!(
+        balanced(&b.ts.transport.calls()[0].script),
+        "create script unbalanced"
+    );
+
+    // update_expr (execute phase of the soft gate)
+    let mut c = fixture(&[r#"{"ok":true,"value":{"id":"e1"}}"#]);
+    let first =
+        c.ts.update("e1", Some("New title"), None, None, None, None, None)
+            .await
+            .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let token = v["confirmation_token"].as_str().unwrap().to_string();
+    let _ =
+        c.ts.update(
+            "e1",
+            Some("New title"),
+            None,
+            None,
+            None,
+            None,
+            Some(&token),
+        )
+        .await
+        .unwrap();
+    assert!(
+        balanced(&c.ts.transport.calls()[0].script),
+        "update script unbalanced"
+    );
+
+    // delete_expr (execute phase of the soft gate)
+    let mut d = fixture(&[r#"{"ok":true,"value":{"id":"e1"}}"#]);
+    let first = d.ts.delete("e1", None).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let token = v["confirmation_token"].as_str().unwrap().to_string();
+    let _ = d.ts.delete("e1", Some(&token)).await.unwrap();
+    assert!(
+        balanced(&d.ts.transport.calls()[0].script),
+        "delete script unbalanced"
+    );
 }
 
 #[cfg(target_os = "macos")]

@@ -1,5 +1,8 @@
 //! Reminders toolset contract tests. All run on every OS via `MockTransport`.
 
+mod common;
+
+use common::balanced;
 use mcp_macos::reminders::RemindersToolset;
 use personai_core::macos::MockTransport;
 use serde_json::Value;
@@ -111,4 +114,68 @@ async fn complete_is_soft_gated_and_uses_whose_id() {
     assert_eq!(v2["status"], "completed");
     let script = &f.ts.transport.calls()[0].script;
     assert!(script.contains(r#"whose({id: "r1"})"#), "{script}");
+}
+
+/// Balance oracle over every generated Reminders script.
+#[tokio::test]
+async fn generated_scripts_are_syntactically_balanced() {
+    // LISTS_EXPR
+    let mut a = fixture(&[r#"{"ok":true,"value":{"lists":[]}}"#]);
+    let _ = a.ts.list_lists().await.unwrap();
+    assert!(
+        balanced(&a.ts.transport.calls()[0].script),
+        "lists script unbalanced"
+    );
+
+    // read_expr
+    let env = r#"{"ok":true,"value":{"total":0,"offset":0,"limit":20,"reminders":[]}}"#;
+    let mut b = fixture(&[env]);
+    let _ =
+        b.ts.read(Some("Work".into()), false, None, 0)
+            .await
+            .unwrap();
+    assert!(
+        balanced(&b.ts.transport.calls()[0].script),
+        "read script unbalanced"
+    );
+
+    // create_expr (execute phase of the soft gate)
+    let mut c = fixture(&[r#"{"ok":true,"value":{"id":"r9"}}"#]);
+    let first =
+        c.ts.create(
+            "Call bank",
+            Some("Work"),
+            Some("2026-08-25T09:00:00Z"),
+            Some("notes"),
+            None,
+        )
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&first).unwrap();
+    let token = v["confirmation_token"].as_str().unwrap().to_string();
+    let _ =
+        c.ts.create(
+            "Call bank",
+            Some("Work"),
+            Some("2026-08-25T09:00:00Z"),
+            Some("notes"),
+            Some(&token),
+        )
+        .await
+        .unwrap();
+    assert!(
+        balanced(&c.ts.transport.calls()[0].script),
+        "create script unbalanced"
+    );
+
+    // complete_expr (execute phase of the soft gate)
+    let mut d = fixture(&[r#"{"ok":true,"value":{"id":"r1"}}"#]);
+    let first = d.ts.complete("r1", None).await.unwrap();
+    let v: Value = serde_json::from_str(&first).unwrap();
+    let token = v["confirmation_token"].as_str().unwrap().to_string();
+    let _ = d.ts.complete("r1", Some(&token)).await.unwrap();
+    assert!(
+        balanced(&d.ts.transport.calls()[0].script),
+        "complete script unbalanced"
+    );
 }

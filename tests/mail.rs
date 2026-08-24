@@ -1,5 +1,8 @@
 //! Mail toolset contract tests. All run on every OS via `MockTransport`.
 
+mod common;
+
+use common::balanced;
 use mcp_macos::mail::{MailGroupBy, MailTargets, MailToolset};
 use personai_core::macos::MockTransport;
 use personai_core::safety::SoftGate;
@@ -670,37 +673,6 @@ async fn snippets_center_on_first_matching_term() {
     );
 }
 
-/// Counts parens/braces outside string literals; guards against the class
-/// of regression where a format-template edit leaves a generated JXA
-/// script syntactically dead (every mail_search 500s at parse time).
-fn balanced(script: &str) -> bool {
-    let mut depth: i32 = 0;
-    let mut in_str = false;
-    let mut escaped = false;
-    for c in script.chars() {
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == '\\' {
-                escaped = true;
-            } else if c == '\'' {
-                in_str = false;
-            }
-            continue;
-        }
-        match c {
-            '\'' => in_str = true,
-            '{' | '(' => depth += 1,
-            '}' | ')' => depth -= 1,
-            _ => {}
-        }
-        if depth < 0 {
-            return false;
-        }
-    }
-    depth == 0
-}
-
 #[tokio::test]
 async fn generated_scripts_are_syntactically_balanced() {
     // Grouped multi-target path (regression: missing for-loop closer made
@@ -724,7 +696,8 @@ async fn generated_scripts_are_syntactically_balanced() {
         .unwrap();
     assert!(
         balanced(&f.ts.transport.calls()[0].script),
-        "grouped script unbalanced"
+        "grouped script unbalanced: {}",
+        f.ts.transport.calls()[0].script
     );
 
     // Row mode + single-box path.
