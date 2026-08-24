@@ -5,6 +5,13 @@ versions are semver (0.x: breaking changes bump minor).
 
 ## [Unreleased]
 
+### Fixed
+- Regression: a grouped-return refactor dropped the for-loop closer and the
+  folder provenance field from generated search scripts, breaking every
+  `mail_search` at JXA parse time and nulling group folder tags. Both are
+  now guarded by new contract tests (script balance oracle + folder
+  provenance assertion) so this failure class cannot recur silently.
+
 ### Added
 - `until` parameter on `mail_search` (exclusive upper bound) — bounded
   date windows without post-filtering.
