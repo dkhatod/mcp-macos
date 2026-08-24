@@ -23,6 +23,7 @@ pub mod calendar;
 pub mod clipboard;
 pub mod contacts;
 pub mod mail;
+pub mod mail_index;
 pub mod messages;
 pub mod notifications;
 pub mod permissions;
