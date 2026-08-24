@@ -48,3 +48,9 @@ touches nothing else.
 Rust stable, edition 2024 · conventional commits (`feat:`, `fix:`, `docs:`)
 · clippy `-D warnings` + rustfmt clean at every commit · spec lives at
 `../personai/docs/superpowers/specs/2026-08-20-personai-mcp-suite-design.md`.
+
+## Publishing
+
+NEVER run `cargo publish` or push release tags without explicit user
+approval in the current conversation. Until approval, link sibling repos by
+path and bump versions locally only.

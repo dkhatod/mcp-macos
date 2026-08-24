@@ -174,6 +174,38 @@ impl<T: AppleTransport> MailToolset<T> {
         snippets: bool,
     ) -> Result<String, AppleError> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        // Pre-flight name check: `whose({name})` is unforgiving, and an
+        // unknown account surfaces as raw AppleEvent -1728 two layers up.
+        // Agents pass EMAIL addresses here constantly (list_accounts leads
+        // with them); answer with the valid names so they self-correct in
+        // one turn instead of burning calls on -1728s.
+        if let Some(a) = account {
+            let names = run_jxa_json(
+                &mut self.transport,
+                "(() => { const M = Application('Mail'); \
+                 return M.accounts().map(x => x.name()); })()",
+            )
+            .await?;
+            let known: Vec<String> = names
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !known.iter().any(|n| n == a) {
+                return Ok(json!({
+                    "error": format!(
+                        "unknown Mail account {a:?} — pass the account NAME \
+                         from mail_list_accounts, not an email address"
+                    ),
+                    "available_accounts": known,
+                })
+                .to_string());
+            }
+        }
         let v = self
             .run_search_json(&search_expr(
                 query,

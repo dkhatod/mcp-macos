@@ -8,6 +8,13 @@ versions are semver (0.x: breaking changes bump minor).
 ## [0.1.9] — 2026-08-24
 
 ### Fixed
+- **`mail_search(account: …)` crashed with raw `AppleEvent -1728: Can't get
+  object`** when passed an email address instead of Mail's display account
+  name (agents pass emails constantly — `mail_list_accounts` leads with
+  them). Narrowed searches now pre-flight the name against live accounts and
+  return `{error, available_accounts}` for one-turn self-correction.
+- `mail_config` now reports `server_version` so a live session can prove
+  which binary is answering.
 - **Under-counted applications in triage runs**: sender groups now carry
   `distinct_subjects` — the number of distinct normalized subjects behind
   one sender (live and index modes; sender grouping only). Big ATS senders

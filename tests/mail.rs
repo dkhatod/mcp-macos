@@ -78,7 +78,11 @@ async fn search_returns_metadata_only_and_paginates() {
 
 #[tokio::test]
 async fn search_escapes_user_text_into_script() {
-    let mut f = fixture(&[r#"{"ok":true,"value":{"total":0,"results":[]}}"#]);
+    // First call is the pre-flight account-name check (see MailToolset::search).
+    let mut f = fixture(&[
+        r#"{"ok":true,"value":["work"]}"#,
+        r#"{"ok":true,"value":{"total":0,"results":[]}}"#,
+    ]);
     let _ =
         f.ts.search(
             "O'Brien \"quoted\" \\path",
@@ -94,7 +98,7 @@ async fn search_escapes_user_text_into_script() {
         )
         .await
         .unwrap();
-    let script = &f.ts.transport.calls()[0].script;
+    let script = &f.ts.transport.calls()[1].script;
     // Quotes and backslashes escaped so the text cannot break out of the
     // JS string literal; queries are matched case-insensitively, so the
     // embedded text is the lowercased query.
@@ -244,7 +248,10 @@ async fn list_mailboxes_returns_counts_and_respects_filter() {
 
 #[tokio::test]
 async fn search_targets_named_mailbox_when_given() {
-    let mut f = fixture(&[r#"{"ok":true,"value":{"total":0,"results":[]}}"#]);
+    let mut f = fixture(&[
+        r#"{"ok":true,"value":["Google"]}"#,
+        r#"{"ok":true,"value":{"total":0,"results":[]}}"#,
+    ]);
     let _ =
         f.ts.search(
             "x",
@@ -260,7 +267,7 @@ async fn search_targets_named_mailbox_when_given() {
         )
         .await
         .unwrap();
-    let script = &f.ts.transport.calls()[0].script;
+    let script = &f.ts.transport.calls()[1].script;
     assert!(
         script.contains(r#""Work""#),
         "mailbox not targeted: {script}"

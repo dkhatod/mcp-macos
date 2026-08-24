@@ -705,7 +705,7 @@ impl MacosServer {
         description = "Read-only doctor for the active Mail scope policy: returns {mode, folders (FULL effective list of Account/Mailbox entries accepted by mail_search — not truncated), default_from, deny_set (mailbox names excluded when no explicit allowlist is configured), state_dir (personai state directory; consult job-apps.json there for status/history tasks), state_files (json files currently in state_dir)}. No arguments, no side effects.",
         annotations(read_only_hint = true)
     )]
-    async fn mail_config(&self) -> String {
+    pub async fn mail_config(&self) -> String {
         let state_files = std::fs::read_dir(&self.state_dir)
             .map(|rd| {
                 let mut names: Vec<String> = rd
@@ -718,6 +718,7 @@ impl MacosServer {
             })
             .unwrap_or_default();
         serde_json::json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
             "mode": self.scope.mode(),
             "folders": self.scope.all(),
             "default_from": self.policy.default_from.clone(),
