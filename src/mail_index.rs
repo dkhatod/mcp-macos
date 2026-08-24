@@ -8,9 +8,9 @@
 //! independent — a sweep interrupted by the transport timeout resumes on
 //! the next call with no partial-partition states.
 
-use crate::mail::MailTargets;
+use crate::mail::{MailGroupBy, MailTargets};
 use crate::util::js_str;
-use personai_core::index::IndexHandle;
+use personai_core::index::{IndexError, IndexHandle};
 use personai_core::macos::{AppleError, AppleTransport, run_jxa_json};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -356,4 +356,242 @@ pub async fn sync_targets<T: AppleTransport>(
         "duration_ms": t0.elapsed().as_millis() as u64,
     })
     .to_string())
+}
+
+/// Query parameters for index-mode search (mirrors `mail_search` semantics).
+pub struct IndexQuery<'a> {
+    pub terms: &'a [String],
+    /// `None` = whole synced corpus (unified equivalent).
+    pub pairs: Option<&'a [(String, String)]>,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+    pub limit: u32,
+    pub offset: u32,
+    pub group: Option<MailGroupBy>,
+}
+
+/// SQL-backed equivalent of `search_multi_expr`: term/folder/date filters,
+/// pagination, and live-mode-compatible sender/subject grouping execute
+/// against `index.db` instead of Apple Events. ISO-8601 UTC dates compare
+/// correctly as strings, so windows and ordering need no date parsing.
+pub fn search_index(h: &IndexHandle, q: &IndexQuery) -> Result<String, IndexError> {
+    const SEL: &str =
+        "SELECT apple_id, subject, sender, date_received, mailbox_key FROM mail_messages";
+
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+    if let Some(pairs) = q.pairs.filter(|p| !p.is_empty()) {
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(a, b)| format!("{a}/{b}"))
+            .collect::<Vec<_>>();
+        let ph = vec!["?"; keys.len()].join(", ");
+        clauses.push(format!("mailbox_key IN ({ph})"));
+        params.extend(keys.into_iter().map(|k| json!(k)));
+    }
+    if let Some(s) = q.since.filter(|s| !s.is_empty()) {
+        clauses.push("date_received >= ?".into());
+        params.push(json!(s));
+    }
+    if let Some(u) = q.until.filter(|u| !u.is_empty()) {
+        clauses.push("date_received < ?".into());
+        params.push(json!(u));
+    }
+    for t in q.terms {
+        let tl = t.trim().to_lowercase();
+        if tl.is_empty() {
+            continue;
+        }
+        clauses.push("(instr(lower(subject), ?) > 0 OR instr(lower(sender), ?) > 0)".into());
+        params.push(json!(tl));
+        params.push(json!(tl));
+    }
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+
+    // Freshness marker: max watermark across the queried scopes.
+    let scope_keys: Vec<String> = match q.pairs {
+        Some(pairs) => pairs.iter().map(|(a, b)| format!("{a}/{b}")).collect(),
+        None => h
+            .query(
+                "SELECT scope_key FROM sync_state WHERE source = 'mail'",
+                &[],
+            )?
+            .into_iter()
+            .filter_map(|r| r["scope_key"].as_str().map(str::to_string))
+            .collect(),
+    };
+    let mut data_as_of = String::new();
+    for key in &scope_keys {
+        if let Some((wm, _, _)) = h.watermark("mail", key)?
+            && wm > data_as_of
+        {
+            data_as_of = wm;
+        }
+    }
+
+    let group = q.group.clone();
+    match group {
+        Some(group) => {
+            let all = h.query(
+                &format!("{SEL} {where_sql} ORDER BY date_received DESC"),
+                &params,
+            )?;
+            let total = all.len();
+
+            let norm_sub = |s: &str| -> String {
+                let mut t = s.trim().to_lowercase();
+                loop {
+                    let stripped = t
+                        .trim_start()
+                        .trim_start_matches("re:")
+                        .trim_start()
+                        .trim_start_matches("fwd:")
+                        .trim_start()
+                        .trim_start_matches("fw:");
+                    if stripped.len() == t.len() {
+                        break;
+                    }
+                    t = stripped.to_string();
+                }
+                t.split_whitespace().collect::<Vec<_>>().join(" ")
+            };
+            let addr_of = |f: &str| -> String {
+                let f = f.trim();
+                match (f.find('<'), f.find('>')) {
+                    (Some(a), Some(b)) if b > a => f[a + 1..b].trim().to_lowercase(),
+                    _ => f.to_lowercase(),
+                }
+            };
+            let name_of = |f: &str| -> String {
+                let a = addr_of(f);
+                let base = f.split('<').next().unwrap_or("").trim();
+                let base = base.trim_matches('"');
+                if base.is_empty() { a } else { base.to_string() }
+            };
+
+            struct G {
+                name: String,
+                count: usize,
+                first: String,
+                last: String,
+                latest_id: String,
+                latest_ids: Vec<String>,
+                samples: Vec<String>,
+                folders: Vec<String>,
+            }
+            let mut map: std::collections::HashMap<String, G> = std::collections::HashMap::new();
+            for e in &all {
+                let from = e["sender"].as_str().unwrap_or_default();
+                let subject = e["subject"].as_str().unwrap_or_default();
+                let date = e["date_received"].as_str().unwrap_or_default();
+                let id = e["apple_id"].as_str().unwrap_or_default();
+                let folder = e["mailbox_key"].as_str().unwrap_or_default();
+                let key = match group {
+                    MailGroupBy::Sender => addr_of(from),
+                    MailGroupBy::Subject => norm_sub(subject),
+                };
+                let g = map.entry(key.clone()).or_insert_with(|| G {
+                    name: name_of(from),
+                    count: 0,
+                    first: date.to_string(),
+                    last: String::new(),
+                    latest_id: String::new(),
+                    latest_ids: Vec::new(),
+                    samples: Vec::new(),
+                    folders: Vec::new(),
+                });
+                g.count += 1;
+                if g.first.as_str() > date {
+                    g.first = date.to_string();
+                }
+                if g.last.as_str() < date {
+                    g.last = date.to_string();
+                    g.latest_id = id.to_string();
+                }
+                if g.latest_ids.len() < 3 {
+                    g.latest_ids.push(id.to_string());
+                }
+                let ns = norm_sub(subject);
+                if g.samples.len() < 4 && !g.samples.iter().any(|x| norm_sub(x) == ns) {
+                    g.samples.push(subject.to_string());
+                }
+                if g.folders.len() < 3 && !g.folders.iter().any(|x| x == folder) {
+                    g.folders.push(folder.to_string());
+                }
+            }
+            let mut groups: Vec<(String, G)> = map.into_iter().collect();
+            groups.sort_by(|a, b| {
+                b.1.count
+                    .cmp(&a.1.count)
+                    .then_with(|| b.1.last.cmp(&a.1.last))
+            });
+            let total_groups = groups.len();
+            let start = (q.offset as usize).min(total_groups);
+            let end = ((q.offset as usize) + q.limit as usize).min(total_groups);
+            let page: Vec<Value> = groups[start..end]
+                .iter()
+                .map(|(key, g)| {
+                    json!({
+                        "key": key,
+                        "name": if matches!(group, MailGroupBy::Sender) { g.name.clone() } else { key.clone() },
+                        "count": g.count,
+                        "first": g.first,
+                        "last": g.last,
+                        "latest_id": g.latest_id,
+                        "latest_ids": g.latest_ids,
+                        "sample_subjects": g.samples,
+                        "folders": g.folders,
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "total": total,
+                "total_groups": total_groups,
+                "groups": page,
+                "data_as_of": data_as_of,
+            })
+            .to_string())
+        }
+        None => {
+            let total = h
+                .query(
+                    &format!("SELECT COUNT(*) AS n FROM mail_messages {where_sql}"),
+                    &params,
+                )?
+                .remove(0)["n"]
+                .as_i64()
+                .unwrap_or(0);
+            let mut page_params = params.clone();
+            page_params.push(json!(q.limit));
+            page_params.push(json!(q.offset));
+            let rows = h.query(
+                &format!("{SEL} {where_sql} ORDER BY date_received DESC LIMIT ? OFFSET ?"),
+                &page_params,
+            )?;
+            let results: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r["apple_id"],
+                        "subject": r["subject"],
+                        "from": r["sender"],
+                        "date": r["date_received"],
+                        "folder": r["mailbox_key"],
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "total": total,
+                "offset": q.offset,
+                "limit": q.limit,
+                "results": results,
+                "data_as_of": data_as_of,
+            })
+            .to_string())
+        }
+    }
 }
