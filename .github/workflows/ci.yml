@@ -12,6 +12,16 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
+
+  syntax-oracle:
+    # Compile-checks every generated JXA script with `osacompile` —
+    # compiles without executing, so no app access or TCC grants needed.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --test syntax_oracle
+
   macos:
     # Exercises the real `osascript` path. Integration tests are strictly
     # read-only (list/search/read); gated sends are mock-tested only.
