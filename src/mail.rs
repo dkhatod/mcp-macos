@@ -951,6 +951,17 @@ fn send_expr(to: &str, subject: &str, body: &str, from: Option<&str>) -> String 
 impl<T: AppleTransport> MailToolset<T> {
     /// Cached read: serve from `mail_bodies` when present (adds
     /// `"cached":true`, zero transport cost), else live read + write-through.
+    /// Sync the given targets into `db_path`'s index (see mail_index::sync_targets).
+    pub async fn sync_index(
+        &mut self,
+        handle: &personai_core::index::IndexHandle,
+        targets: &MailTargets,
+        full: bool,
+        scan: u32,
+    ) -> Result<String, AppleError> {
+        crate::mail_index::sync_targets(&mut self.transport, handle, targets, full, scan).await
+    }
+
     pub async fn read_cached(
         &mut self,
         id: &str,

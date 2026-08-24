@@ -277,12 +277,154 @@ impl MacosServer {
     }
 
     #[tool(
+        description = "Refresh the local mail index from Mail.app into state_dir/index.db so subsequent mail_search(source:\"index\") calls are instant and budget-free. Incremental by default (only mail newer than the last watermark is fetched); full:true re-reads whole folders and replaces their cached rows — use it if counts look wrong. Run once per session before index-mode searches; repeat sweeps are O(new mail) and typically take seconds.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn mail_sync(&self, Parameters(p): Parameters<MailSyncParams>) -> String {
+        if !self.enabled.mail {
+            return Self::disabled("mail");
+        }
+        let scan = p.scan_limit.map_or(DEFAULT_SCAN, |s| s.clamp(1, MAX_SCAN));
+        let targets = if p
+            .folders
+            .as_ref()
+            .is_some_and(|fs| fs.iter().any(|f| f == "*"))
+        {
+            if self.scope.is_open() {
+                return serde_json::json!({"error": "folders:[\"*\"] unavailable in open scope (no startup snapshot); name folders explicitly"}).to_string();
+            }
+            mail::MailTargets::Folders(self.scope.all())
+        } else {
+            let entries: Vec<String> = p
+                .folders
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|f| !f.is_empty())
+                .collect();
+            let pairs = if entries.is_empty() {
+                self.scope.all()
+            } else {
+                let (resolved, rejected, _denied) =
+                    policy::resolve_selection(&entries, &self.scope);
+                if let Some(first) = rejected.first() {
+                    return json_result(Err(Self::out_of_scope(first, &self.scope)));
+                }
+                resolved
+            };
+            if let Some(acct) = p.account.as_deref().filter(|a| !a.is_empty()) {
+                mail::MailTargets::Folders(pairs.into_iter().filter(|(a, _)| a == acct).collect())
+            } else {
+                mail::MailTargets::Folders(pairs)
+            }
+        };
+        let db = self.state_dir.join("index.db");
+        let handle = match personai_core::index::IndexHandle::open(&db, mail_index::MAIL_MIGRATIONS)
+        {
+            Ok(h) => h,
+            Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+        };
+        let mut st = self.inner.mail.lock().await;
+        match st
+            .sync_index(&handle, &targets, p.full.unwrap_or(false), scan)
+            .await
+        {
+            Ok(s) => s,
+            Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+        }
+    }
+    #[tool(
         description = "Search the user's email — THE tool for every find/check/read/summarize/triage-email request ('mail about X', 'status of my job applications', 'find receipts'), replacing AppleScript/osascript shell scripts that are slow on real mailboxes, unbounded in output, and unscoped. Terms (query + any_of, OR-combined, ≤8) match case-insensitively against subject or sender; NO terms = match-all census — pair with group_by=\"sender\" to collapse hundreds of messages into one page of {key, count, first, last, latest_id, sample_subjects, folders}. Metadata only ({id, subject, from, date, folder}; snippets off by default — mail_read individual rows), paginated as {total, offset, limit, results|groups, scanned_per_folder, truncated}. Target folders via folders=[\"Account/Mailbox\", …] (inside the configured scope — run mail_config; \"*\" sweeps every scoped folder; a NAMED deny-set folder like [Gmail]/Spam is admitted with scope_note); else account (+mailbox) narrows to one box; else the unified inbox. scan_limit raises per-mailbox depth past the 5000 default when message counts demand it.",
         annotations(read_only_hint = true)
     )]
-    async fn mail_search(&self, Parameters(p): Parameters<MailSearchParams>) -> String {
+
+    pub async fn mail_search(&self, Parameters(p): Parameters<MailSearchParams>) -> String {
         if !self.enabled.mail {
             return Self::disabled("mail");
+        }
+        // Query source: live Mail.app vs the local corpus index.
+        let source = p.source.as_deref().unwrap_or("live");
+        if !matches!(source, "live" | "index") {
+            return serde_json::json!({
+                "error": format!("source must be \"live\" or \"index\", got {source:?}")
+            })
+            .to_string();
+        }
+        let group_early = p.group_by.as_deref().filter(|s| !s.is_empty());
+        if source == "index" {
+            let db = self.state_dir.join("index.db");
+            if !db.exists() {
+                return serde_json::json!({
+                    "error": "no local index yet — run mail_sync first                               (it fills state_dir/index.db from Mail.app)",
+                    "hint": { "folders": ["*"], "full": true }
+                })
+                .to_string();
+            }
+            let handle =
+                match personai_core::index::IndexHandle::open(&db, mail_index::MAIL_MIGRATIONS) {
+                    Ok(h) => h,
+                    Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+                };
+            // Same scope resolution as the live path below.
+            let pairs: Option<Vec<(String, String)>> = if p
+                .folders
+                .as_ref()
+                .is_some_and(|fs| fs.iter().any(|f| f == "*"))
+            {
+                if self.scope.is_open() {
+                    return serde_json::json!({"error":
+                            "folders:[\"*\"] unavailable in open scope; name folders explicitly"})
+                    .to_string();
+                }
+                Some(self.scope.all())
+            } else if p.folders.as_ref().is_none_or(Vec::is_empty) {
+                None // no folder filter = whole synced corpus (unified equivalent)
+            } else {
+                let entries: Vec<String> = p
+                    .folders
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|f| !f.is_empty())
+                    .collect();
+                let (resolved, rejected, _denied) =
+                    policy::resolve_selection(&entries, &self.scope);
+                if let Some(first) = rejected.first() {
+                    return json_result(Err(Self::out_of_scope(first, &self.scope)));
+                }
+                Some(resolved)
+            };
+            let mut terms: Vec<String> = Vec::new();
+            if let Some(q) = p.query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                terms.push(q.to_string());
+            }
+            if let Some(any) = &p.any_of {
+                terms.extend(
+                    any.iter()
+                        .filter(|t| !t.trim().is_empty())
+                        .map(|t| t.trim().to_string()),
+                );
+            }
+            if terms.len() > MAX_TERMS {
+                return serde_json::json!({
+                    "error": format!("too many search terms ({} > {MAX_TERMS})", terms.len())
+                })
+                .to_string();
+            }
+            let group = group_early.and_then(mail::MailGroupBy::parse);
+            let q2 = mail_index::IndexQuery {
+                terms: &terms,
+                pairs: pairs.as_deref(),
+                since: p.since.as_deref(),
+                until: p.until.as_deref(),
+                limit: p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT),
+                offset: p.offset.unwrap_or(0),
+                group,
+            };
+            return match mail_index::search_index(&handle, &q2) {
+                Ok(s) => s,
+                Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+            };
         }
         if p.group_by.is_some()
             && !matches!(p.group_by.as_deref(), Some("sender") | Some("subject"))
@@ -1100,6 +1242,11 @@ pub struct MailSearchParams {
     /// mail_read the rows you actually open.
     #[serde(default)]
     pub include_snippets: Option<bool>,
+    /// Where to search: "live" (default, Mail.app Apple Events, 25 s budget)
+    /// or "index" (the local corpus cache written by mail_sync — instant,
+    /// no budget, response carries data_as_of so you can judge staleness).
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1107,6 +1254,25 @@ pub struct MailMailboxesParams {
     /// Optional account name to narrow the listing.
     #[serde(default)]
     pub account: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MailSyncParams {
+    /// Optional account filter: only folders under this account.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Folders to sync as `["Account/Mailbox", …]`; `["*"]` sweeps every
+    /// scoped folder (unavailable in open scope). Default: every scoped
+    /// folder.
+    #[serde(default)]
+    pub folders: Option<Vec<String>>,
+    /// Ignore watermarks and replace each folder's partition wholesale.
+    /// Use when counts look wrong or mail was moved between folders.
+    #[serde(default)]
+    pub full: Option<bool>,
+    /// Per-mailbox scan depth (default 5000, max 25000).
+    #[serde(default)]
+    pub scan_limit: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]
