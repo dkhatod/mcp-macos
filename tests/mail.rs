@@ -584,3 +584,48 @@ fn token_of(res: &str) -> String {
         .unwrap()
         .to_string()
 }
+
+#[tokio::test]
+async fn grouped_mode_carries_latest_ids_and_four_samples() {
+    // A sender group is an INDEX entry, not an entity: one sender often
+    // spans several threads/postings, so groups must surface the 3 newest
+    // ids and 4 sample subjects for drill-down.
+    let env = r#"{"ok":true,"value":{"total":9,"total_groups":1,"groups":[{"key":"a@amazon.jobs","name":"Amazon","count":9,"first":"2026-05-19T00:00:00Z","last":"2026-08-08T00:00:00Z","latest_id":"30244","latest_ids":["30244","30245","30256"],"sample_subjects":["incomplete Kiro","incomplete Optics","status update Database","track Leo"],"folders":["Google/INBOX"]}],"scanned_per_folder":{"Unified/Inbox":100},"truncated":false}}"#;
+    let mut f = fixture(&[env]);
+    let res =
+        f.ts.search_multi(
+            &MailTargets::Unified,
+            "",
+            &[],
+            None,
+            20,
+            0,
+            Some(MailGroupBy::Sender),
+            5000,
+            false,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).unwrap();
+    let g = &v["groups"][0];
+    assert_eq!(g["latest_ids"].as_array().unwrap().len(), 3);
+    assert_eq!(g["sample_subjects"].as_array().unwrap().len(), 4);
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(script.contains("latest_ids.push(e.id)"), "{script}");
+    assert!(script.contains("g.samples.length < 4"), "{script}");
+}
+
+#[tokio::test]
+async fn read_accepts_unified_inbox_tag_from_search_rows() {
+    // Unified-mode search tags rows "Unified/Inbox"; mail_read must accept
+    // that tag and fall back to the inbox-first sweep instead of erroring.
+    let mut f = fixture(&[r#"{"ok":true,"value":{"id":"m1","subject":"s","body":"b"}}"#]);
+    let res = f.ts.read("m1", Some("Unified/Inbox")).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&res).unwrap();
+    assert_eq!(v["body"], "b");
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(
+        !script.contains(r#""Unified""#),
+        "unified tag must not resolve as a real account: {script}"
+    );
+}

@@ -221,7 +221,8 @@ impl<T: AppleTransport> MailToolset<T> {
     /// `folder` tag (`"Account/Mailbox"`). With `group`, rows collapse into
     /// `{total, total_groups, groups, scanned_per_folder[, truncated]}`
     /// where each group carries `key, name, count, first, last,
-    /// latest_id, sample_subjects, folders`. Metadata only — never bodies;
+    /// latest_id, latest_ids (3 newest — one sender often spans several
+    /// threads/postings), sample_subjects (4), folders`. Metadata only — never bodies;
     /// `snippets = false` skips per-row body previews entirely (they cost
     /// one Apple Event each).
     #[allow(clippy::too_many_arguments)]
@@ -295,6 +296,10 @@ impl<T: AppleTransport> MailToolset<T> {
     /// bounded per-mailbox sweep. Bodies are capped at [`READ_MAX_CHARS`]
     /// with `body_truncated: true`.
     pub async fn read(&mut self, id: &str, folder: Option<&str>) -> Result<String, AppleError> {
+        // Unified-mode search tags rows "Unified/Inbox"; that is not a real
+        // account/mailbox pair, so route those to the inbox-first sweep
+        // instead of failing with `account not found: "Unified"`.
+        let folder = folder.filter(|f| *f != "Unified/Inbox");
         let v = run_jxa_json(&mut self.transport, &read_expr(id, folder)).await?;
         Ok(v.to_string())
     }
@@ -636,14 +641,15 @@ fn search_multi_expr(
       const key = GROUP === 'sender' ? addrOf(e.from) : normSub(e.subject);
       let g = map.get(key);
       if (!g) {{
-        g = {{ key: key, name: nameOf(e.from), count: 0, first_ms: e.ms, first: e.date, last_ms: e.ms, last: e.date, latest_id: e.id, samples: [], folders: [] }};
+        g = {{ key: key, name: nameOf(e.from), count: 0, first_ms: e.ms, first: e.date, last_ms: e.ms, last: e.date, latest_id: e.id, latest_ids: [], samples: [], folders: [] }};
         map.set(key, g);
       }}
       g.count++;
       if (e.ms < g.first_ms) {{ g.first_ms = e.ms; g.first = e.date; }}
       if (e.ms > g.last_ms) {{ g.last_ms = e.ms; g.last = e.date; g.latest_id = e.id; }}
       const ns = normSub(e.subject);
-      if (g.samples.length < 2 && !g.samples.some(x => normSub(x) === ns)) g.samples.push(String(e.subject == null ? '' : e.subject));
+      if (g.latest_ids.length < 3) g.latest_ids.push(e.id);
+      if (g.samples.length < 4 && !g.samples.some(x => normSub(x) === ns)) g.samples.push(String(e.subject == null ? '' : e.subject));
       if (g.folders.length < 3 && !g.folders.includes(e.folder)) g.folders.push(e.folder);
     }}
     let allGroups = Array.from(map.values());
@@ -660,6 +666,7 @@ fn search_multi_expr(
         first: g.first,
         last: g.last,
         latest_id: g.latest_id,
+        latest_ids: g.latest_ids,
         sample_subjects: g.samples,
         folders: g.folders,
       }});
