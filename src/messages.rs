@@ -90,7 +90,7 @@ impl<T: AppleTransport> MessagesToolset<T> {
                 "status": "requires_confirmation",
                 "payload": payload,
                 "confirmation_token": token,
-                "note": "Show this payload to the user; re-invoke messages_send with confirmation_token to execute.",
+                "note": "re-invoke with confirmation_token",
             })
             .to_string()),
             GateOutcome::Execute => {
@@ -134,7 +134,7 @@ fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
          SELECT COALESCE(CASE WHEN m.is_from_me=1 THEN 'me' ELSE h.id END,'unknown'),\
          CASE WHEN m.is_from_me=1 THEN 'out' ELSE 'in' END,\
          REPLACE(REPLACE(COALESCE(m.text,''),char(13),' '),char(10),' '),\
-         datetime(m.date/1000000000+978307200,'unixepoch') \
+         REPLACE(datetime(m.date/1000000000+978307200,'unixepoch'),' ','T')||'Z' \
          {from_join} WHERE 1=1{chat_filter} ORDER BY m.date DESC \
          LIMIT {limit} OFFSET {offset};\""
     );
@@ -149,10 +149,11 @@ fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
     const [from, direction, text, date] = line.split('|||');
     return {{from: from, direction: direction, text: text || '', date: date}};
   }});
-  return {{total: total, offset: {}, limit: {}, messages: messages}};
+  const ret = {{total: total, messages: messages}};
+  if (messages.length < {}) ret.more = true;
+  return ret;
 }})()"#,
         js_str(&cmd),
-        offset,
         limit,
     )
 }
@@ -189,11 +190,9 @@ fn chats_expr(limit: u32, offset: u32) -> String {
             handle: handle, message_count: Number(message_count) || 0,
             last_activity: last_activity}};
   }});
-  return {{total: total, offset: {}, limit: {}, chats: chats}};
+  return {{total: total, chats: chats}};
 }})()"#,
         js_str(&cmd),
-        offset,
-        limit,
     )
 }
 

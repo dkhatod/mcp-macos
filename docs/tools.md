@@ -58,7 +58,7 @@ not in the inbox). Scan window: newest 1000 messages (`SCAN_MAX` in
 | include_snippets | bool? | default true; `false` skips body previews for much faster pages |
 
 ```json
-{"total": 3, "offset": 0, "limit": 2, "results": [
+{"total": 3, "results": [
   {"id": "30575", "subject": "…", "from": "…", "date": "2026-08-21T16:01:33Z",
    "snippet": "first 140 chars"}
 ]}
@@ -114,7 +114,7 @@ Newest first.
 | limit / offset | u32? | default 20 / hard max 100 |
 
 ```json
-{"total": 5, "offset": 0, "limit": 20, "messages": [
+{"total": 5, "messages": [
   {"from": "+15550001111", "direction": "in", "text": "Call me",
    "date": "2026-08-19T12:00:00Z"}
 ]}
@@ -146,7 +146,7 @@ Same flow as `mail_send`: `{to, body}` → confirmation token → execute.
 | limit / offset | u32? | default 20 / hard max 100 |
 
 ```json
-{"total": 2, "offset": 0, "limit": 20, "events": [
+{"total": 2, "events": [
   {"id": "E1A2…", "title": "Acme phone screen",
    "start": "2026-08-21T14:00:00Z", "end": "2026-08-21T14:30:00Z",
    "calendar": "Home"}

@@ -187,6 +187,7 @@ impl<T: AppleTransport> MailToolset<T> {
             ))
             .await?;
         let total = v.get("total").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let timed_out = v.get("truncated").and_then(Value::as_bool).unwrap_or(false);
         let mut results = v
             .get("results")
             .and_then(Value::as_array)
@@ -201,13 +202,13 @@ impl<T: AppleTransport> MailToolset<T> {
             }
         }
         results.truncate(limit as usize);
-        Ok(json!({
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "results": results,
-        })
-        .to_string())
+        // Token diet: no offset/limit echo (the caller just sent them),
+        // `truncated` only when true.
+        let mut payload = json!({ "total": total, "results": results });
+        if timed_out {
+            payload["truncated"] = json!(true);
+        }
+        Ok(payload.to_string())
     }
 
     /// Searches one or more targets with a SINGLE script and merges the
@@ -215,15 +216,14 @@ impl<T: AppleTransport> MailToolset<T> {
     /// is checked between targets: expiry stops the sweep early and
     /// `truncated: true` reports the partial coverage.
     ///
-    /// Row mode (default) payload:
-    /// `{total, offset, limit, results, scanned_per_folder, truncated}`
-    /// where each result carries its `folder` tag (`"Account/Mailbox"`).
-    /// With `group`, rows collapse into
-    /// `{total, total_groups, offset, limit, groups, scanned_per_folder,
-    /// truncated}` where each group carries `key, name, count, first,
-    /// last, latest_id, sample_subjects, folders`. Metadata only — never
-    /// bodies; `snippets = false` skips per-row body previews entirely
-    /// (they cost one Apple Event each).
+    /// Row mode (default) payload: `{total, results,
+    /// scanned_per_folder[, truncated]}` where each result carries its
+    /// `folder` tag (`"Account/Mailbox"`). With `group`, rows collapse into
+    /// `{total, total_groups, groups, scanned_per_folder[, truncated]}`
+    /// where each group carries `key, name, count, first, last,
+    /// latest_id, sample_subjects, folders`. Metadata only — never bodies;
+    /// `snippets = false` skips per-row body previews entirely (they cost
+    /// one Apple Event each).
     #[allow(clippy::too_many_arguments)]
     pub async fn search_multi(
         &mut self,
@@ -250,19 +250,19 @@ impl<T: AppleTransport> MailToolset<T> {
             .unwrap_or_else(|| json!({}));
         let truncated = v.get("truncated").and_then(Value::as_bool).unwrap_or(false);
         if let Some(groups) = v.get("groups").cloned() {
-            return Ok(json!({
+            let mut payload = json!({
                 "total": total,
                 "total_groups": v
                     .get("total_groups")
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
-                "offset": offset,
-                "limit": limit,
                 "groups": groups,
                 "scanned_per_folder": scanned,
-                "truncated": truncated,
-            })
-            .to_string());
+            });
+            if truncated {
+                payload["truncated"] = json!(true);
+            }
+            return Ok(payload.to_string());
         }
         let mut results = v
             .get("results")
@@ -278,15 +278,15 @@ impl<T: AppleTransport> MailToolset<T> {
             }
         }
         results.truncate(limit as usize);
-        Ok(json!({
+        let mut payload = json!({
             "total": total,
-            "offset": offset,
-            "limit": limit,
             "results": results,
             "scanned_per_folder": scanned,
-            "truncated": truncated,
-        })
-        .to_string())
+        });
+        if truncated {
+            payload["truncated"] = json!(true);
+        }
+        Ok(payload.to_string())
     }
 
     /// Reads one full message by id (from `search` results). `folder`
@@ -316,7 +316,7 @@ impl<T: AppleTransport> MailToolset<T> {
                 "status": "requires_confirmation",
                 "payload": payload,
                 "confirmation_token": token,
-                "note": "Show this payload to the user; re-invoke mail_forward with confirmation_token to execute.",
+                "note": "re-invoke with confirmation_token",
             })
             .to_string()),
             GateOutcome::Execute => {
@@ -341,7 +341,7 @@ impl<T: AppleTransport> MailToolset<T> {
                 "status": "requires_confirmation",
                 "payload": payload,
                 "confirmation_token": token,
-                "note": "Show this payload to the user; re-invoke mail_reply with confirmation_token to execute.",
+                "note": "re-invoke with confirmation_token",
             })
             .to_string()),
             GateOutcome::Execute => {
@@ -373,7 +373,7 @@ impl<T: AppleTransport> MailToolset<T> {
                 "status": "requires_confirmation",
                 "payload": payload,
                 "confirmation_token": token,
-                "note": "Show this payload to the user; re-invoke mail_send with confirmation_token to execute. Optionally pass from to pick the sending identity (see list_accounts); omit it for the default account.",
+                "note": "re-invoke with confirmation_token",
             })
             .to_string()),
             GateOutcome::Execute => {
@@ -517,17 +517,18 @@ fn search_expr(
     if (Date.now() - t0 > BUDGET_MS) {{ timedOut = true; break; }}
     const i = idx[k];
     const m = box.messages[i];
-    let snippet = '';
-    if ({snippets}) {{ try {{ snippet = String(m.content()).slice(0, 140); }} catch (e) {{}} }}
-    out.push({{
+    const row = {{
       id: String(ids[i]),
       subject: subjects[i],
       from: senders[i],
-      date: dates[i].toISOString(),
-      snippet: snippet,
-    }});
+      date: dates[i].toISOString().slice(0, 19) + 'Z',
+    }};
+    if ({snippets}) {{ try {{ const s = String(m.content()).slice(0, 140); if (s) row.snippet = s; }} catch (e) {{}} }}
+    out.push(row);
   }}
-  return {{total: total, results: out, truncated: timedOut}};
+  const ret = {{total: total, results: out}};
+  if (timedOut) ret.truncated = true;
+  return ret;
 }})()"#
     )
 }
@@ -618,10 +619,7 @@ fn search_multi_expr(
           id: String(ids[i]),
           subject: subjects[i],
           from: senders[i],
-          ms: dates[i].getTime(),
-          date: dates[i].toISOString(),
-          snippet: '',
-          folder: label,
+          date: dates[i].toISOString().slice(0, 19) + 'Z',
           ref: box.messages[i],
         }});
       }}
@@ -665,26 +663,22 @@ fn search_multi_expr(
         sample_subjects: g.samples,
         folders: g.folders,
       }});
-    }}
-    return {{total: total, total_groups: totalGroups, offset: {offset}, limit: {limit}, groups: page, scanned_per_folder: scannedPerFolder, truncated: truncated}};
+    const ret = {{total: total, total_groups: totalGroups, groups: page, scanned_per_folder: scannedPerFolder}};
+    if (truncated) ret.truncated = true;
+    return ret;
   }}
   const end = Math.min({offset} + {limit}, total);
   const out = [];
   for (let k = {offset}; k < end; k++) {{
     if (Date.now() - t0 > BUDGET_MS) {{ truncated = true; break; }}
     const e = merged[k];
-    let snippet = '';
-    if (SNIPPETS) {{ try {{ snippet = String(e.ref.content()).slice(0, 140); }} catch (err) {{}} }}
-    out.push({{
-      id: e.id,
-      subject: e.subject,
-      from: e.from,
-      date: e.date,
-      snippet: snippet,
-      folder: e.folder,
-    }});
+    const row = {{ id: e.id, subject: e.subject, from: e.from, date: e.date, folder: e.folder }};
+    if (SNIPPETS) {{ try {{ const s = String(e.ref.content()).slice(0, 140); if (s) row.snippet = s; }} catch (err) {{}} }}
+    out.push(row);
   }}
-  return {{total: total, results: out, scanned_per_folder: scannedPerFolder, truncated: truncated}};
+  const ret = {{total: total, results: out, scanned_per_folder: scannedPerFolder}};
+  if (truncated) ret.truncated = true;
+  return ret;
 }})()"#
     )
 }

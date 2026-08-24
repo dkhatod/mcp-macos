@@ -70,13 +70,11 @@ fn search_expr(query: &str, limit: u32, offset: u32) -> String {
     const i = idx[k];
     let phones = [];
     try {{ phones = people[i].phones.value().map(p => String(p)); }} catch (e) {{}}
-    out.push({{
-      id: String(ids[i]),
-      name: names[i],
-      organization: (orgs && orgs[i]) || '',
-      emails: (emailsNested && emailsNested[i] ? emailsNested[i].map(String) : []),
-      phones: phones,
-    }});
+    const c = {{ id: String(ids[i]), name: names[i] }};
+    if (orgs && orgs[i]) c.organization = orgs[i];
+    if (emailsNested && emailsNested[i] && emailsNested[i].length) c.emails = emailsNested[i].map(String);
+    if (phones.length) c.phones = phones;
+    out.push(c);
   }}
   return {{total: total, offset: {offset}, limit: {limit}, contacts: out}};
 }})()"#,

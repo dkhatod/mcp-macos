@@ -100,7 +100,7 @@ impl<T: AppleTransport> RemindersToolset<T> {
                 "status": "requires_confirmation",
                 "payload": payload,
                 "confirmation_token": token,
-                "note": "Show this payload to the user; re-invoke reminders_create with confirmation_token to execute.",
+                "note": "re-invoke with confirmation_token",
             })
             .to_string()),
             GateOutcome::Execute => {
@@ -172,8 +172,12 @@ fn read_expr(list: Option<&str>, include_completed: bool, limit: u32, offset: u3
     try {{ body = String(box[i].body() || ''); }} catch (e) {{}}
     let priority = 0;
     try {{ priority = Number(box[i].priority()) || 0; }} catch (e) {{}}
-    out.push({{ id: String(ids[i]), name: names[i], due: due, body: body,
-               priority: priority, completed: done ? !!done[i] : null }});
+    const r = {{ id: String(ids[i]), name: names[i] }};
+    if (due) r.due = due;
+    if (body) r.body = body;
+    if (priority) r.priority = priority;
+    if (done) r.completed = !!done[i];
+    out.push(r);
   }}
   return {{total: total, offset: {offset}, limit: {limit}, reminders: out}};
 }})()"#,

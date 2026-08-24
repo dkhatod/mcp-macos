@@ -164,7 +164,7 @@ fn confirm_response(payload: Value, token: String) -> String {
         "status": "requires_confirmation",
         "payload": payload,
         "confirmation_token": token,
-        "note": "Show this payload to the user; re-invoke with confirmation_token to execute.",
+        "note": "re-invoke with confirmation_token",
     })
     .to_string()
 }

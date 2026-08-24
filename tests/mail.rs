@@ -50,7 +50,10 @@ async fn search_returns_metadata_only_and_paginates() {
             .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     assert_eq!(v["total"], 3, "total reflects matches, not page size");
-    assert_eq!(v["offset"], 0);
+    assert!(
+        v.get("offset").is_none() && v.get("limit").is_none(),
+        "token diet: caller params must not be echoed back"
+    );
     assert_eq!(v["results"].as_array().unwrap().len(), 2);
     assert!(
         v["results"][0].get("body").is_none(),
@@ -306,8 +309,10 @@ async fn search_multi_merges_folders_paginates_and_strips_bodies() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     assert_eq!(v["total"], 3, "total is pre-pagination across all folders");
-    assert_eq!(v["offset"], 1);
-    assert_eq!(v["limit"], 2);
+    assert!(
+        v.get("offset").is_none() && v.get("limit").is_none(),
+        "token diet: no param echo"
+    );
     let page = v["results"].as_array().unwrap();
     assert_eq!(page.len(), 2);
     assert_eq!(page[0]["id"], "m2", "global date-desc merge order");
@@ -315,7 +320,10 @@ async fn search_multi_merges_folders_paginates_and_strips_bodies() {
     assert_eq!(page[1]["folder"], "Work/Archive", "folder tag survives");
     assert!(page.iter().all(|r| r.get("body").is_none()));
     assert_eq!(v["scanned_per_folder"]["Work/Inbox"], 12);
-    assert_eq!(v["truncated"], false);
+    assert!(
+        v.get("truncated").is_none(),
+        "token diet: truncated omitted when false"
+    );
     // Exactly ONE script for both folders, carrying budget + scan caps.
     assert_eq!(f.ts.transport.calls().len(), 1);
     let script = &f.ts.transport.calls()[0].script;
@@ -545,7 +553,10 @@ async fn send_passes_from_through_only_when_given() {
             .unwrap();
     let cv: serde_json::Value = serde_json::from_str(&c2).unwrap();
     assert_eq!(cv["payload"]["from"], "Work");
-    assert!(cv["note"].as_str().unwrap().contains("from"));
+    assert!(
+        cv["note"].as_str().unwrap().contains("confirmation_token"),
+        "gate note trimmed but present"
+    );
     let t2 = token_of(&c2);
     f.ts.send("mom@x", "Hi", "Hello!", Some("Work"), Some(&t2))
         .await

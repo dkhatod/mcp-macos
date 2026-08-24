@@ -3,6 +3,17 @@
 All notable changes. Format follows [Keep a Changelog](https://keepachangelog.com);
 versions are semver (0.x: breaking changes bump minor).
 
+## [Unreleased]
+
+### Changed
+- Token diet across every tool payload: caller-supplied `offset`/`limit`
+  are no longer echoed back; `truncated:false` is omitted (present only
+  when true); dates drop millisecond precision; empty strings/arrays/null
+  fields (`snippet`, `organization`, `emails`, `phones`, `body`, `due`,
+  `priority`) are omitted instead of emitted; soft-gate notes trimmed to
+  `re-invoke with confirmation_token`. Typical census pages shrink ~30%.
+- Docs examples updated to the dieted shapes.
+
 ## [0.1.7] — 2026-08-23
 
 ### Added
