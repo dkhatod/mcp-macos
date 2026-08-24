@@ -1,6 +1,6 @@
 {
   "project": "mcp-macos",
-  "updated": "2026-08-22",
+  "updated": "2026-08-24",
   "features": [
     {
       "id": "scaffold",
@@ -67,6 +67,18 @@
       "name": "crates.io publish v0.1.0",
       "status": "done",
       "evidence": "personai-core 0.1.0 and mcp-macos 0.1.0 live on crates.io; path dep flipped to version; tags v0.1.0 (local, push pending remote)"
+    },
+    {
+      "id": "mail-index",
+      "name": "Local mail index: mail_sync (watermarked, per-folder commits) + mail_search source:\"index\" + body cache",
+      "status": "done",
+      "evidence": "commits 9fe6c7f/dd348b8/90cdcba/5774605/1c632ef; new suites mail_index(7) mail_search_index(4) mail_body_cache(4) mail_server_index(4); core perf guard 25k rows"
+    },
+    {
+      "id": "live-acceptance-018",
+      "name": "Live acceptance: D9 benchmark table (first sync \u226490s, delta <10s, census <50ms, cached read <5ms)",
+      "status": "todo",
+      "evidence": "user runs per docs/tools.md; requires real Mail.app"
     }
   ]
 }

@@ -3,6 +3,23 @@
 Newest entry on top. Read top-to-bottom to reconstruct state; prepend after
 each session. `feature_list.json` is the authoritative feature/status map.
 
+## 2026-08-24 — Run 4: local memory layer (0.1.8)
+
+**State:** Built and committed locally; crates.io untouched (path dep on
+../personai-core until first publish). Live acceptance pending.
+
+**Shipped:** `mail_sync` tool, `mail_search(source:"index")`, cached
+`mail_read` — all over a new SQLite corpus index (`state_dir/index.db`)
+built on personai-core 0.2's generic index engine. FTS5 mirror maintained
+by triggers; fingerprints detect Apple-id reuse; per-folder commits make
+sweeps resumable.
+
+**Verification evidence:** cargo test 97 passed / 1 failed
+(`real_messages_read` — pre-existing live chat.db parse failure, reproduced
+on pre-change code); clippy `-D warnings` clean; fmt clean. New test suites:
+tests/mail_index.rs, tests/mail_search_index.rs, tests/mail_body_cache.rs,
+tests/mail_server_index.rs.
+
 ## 2026-08-22 — Run 2 complete: all v1 features built and verified
 
 **State:** All plan tasks 6–10 plus spec §11.1 additions implemented,
