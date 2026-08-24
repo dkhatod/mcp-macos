@@ -132,6 +132,13 @@ Groups: `mail`, `messages`, `calendar`, `contacts`, `reminders`,
 - **Full Disk Access** for the process running the server, for
   `messages_read` (it reads `~/Library/Messages/chat.db` via `sqlite3`).
 
+## Output format note
+
+Array payloads are emitted **one record per line** (still valid JSON).
+Client output-compaction features that truncate long single lines will
+then drop whole records instead of mid-record fragments — pair this with
+a generous tool-output threshold in your client config for best results.
+
 ## Anti-features (binding)
 
 - No telemetry, ever. No outbound network calls from the server.

@@ -30,7 +30,7 @@ impl<T: AppleTransport> ContactsToolset<T> {
     ) -> Result<String, AppleError> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let v = run_jxa_json(&mut self.transport, &search_expr(query, limit, offset)).await?;
-        Ok(v.to_string())
+        Ok(crate::util::unwrap_string_payload(v)?.to_string())
     }
 }
 
@@ -76,7 +76,8 @@ fn search_expr(query: &str, limit: u32, offset: u32) -> String {
     if (phones.length) c.phones = phones;
     out.push(c);
   }}
-  return {{total: total, offset: {offset}, limit: {limit}, contacts: out}};
+  const rows = out.map(c => JSON.stringify(c)).join(',\n');
+  return '{{"total":' + total + ',"contacts":[\n' + rows + '\n]}}';
 }})()"#,
         js_str(&query.to_lowercase()),
     )

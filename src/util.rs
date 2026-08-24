@@ -31,3 +31,30 @@ mod tests {
         assert_eq!(js_str("\u{1}"), "\"\\u0001\"");
     }
 }
+
+/// Serializes rows one-per-line inside a JSON array so client-side output
+/// compactors degrade gracefully: they drop whole records from the middle
+/// instead of slicing through a single giant line (observed with OMP).
+pub(crate) fn join_rows(rows: &[serde_json::Value]) -> String {
+    let mut s = String::new();
+    for (i, r) in rows.iter().enumerate() {
+        if i > 0 {
+            s.push_str(",\n");
+        }
+        s.push_str(&r.to_string());
+    }
+    s
+}
+
+/// When a builder returns its payload as a pre-serialized multi-line JSON
+/// string (row-per-line diet), the transport envelope carries it as
+/// `Value::String`; unwrap and re-parse so callers see the object shape.
+pub(crate) fn unwrap_string_payload(
+    v: serde_json::Value,
+) -> Result<serde_json::Value, personai_core::macos::AppleError> {
+    match v {
+        serde_json::Value::String(s) => serde_json::from_str(&s)
+            .map_err(|e| personai_core::macos::AppleError::Parse(e.to_string())),
+        other => Ok(other),
+    }
+}

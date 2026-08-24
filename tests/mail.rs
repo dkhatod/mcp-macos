@@ -45,9 +45,20 @@ async fn search_returns_metadata_only_and_paginates() {
     let env = format!(r#"{{"ok":true,"value":{mailbox}}}"#);
     let mut f = fixture(&[&env]);
     let res =
-        f.ts.search("application", &[], None, None, None, Some(2), 0, 5000, true)
-            .await
-            .unwrap();
+        f.ts.search(
+            "application",
+            &[],
+            None,
+            None,
+            None,
+            None,
+            Some(2),
+            0,
+            5000,
+            true,
+        )
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
     assert_eq!(v["total"], 3, "total reflects matches, not page size");
     assert!(
@@ -70,6 +81,7 @@ async fn search_escapes_user_text_into_script() {
             "O'Brien \"quoted\" \\path",
             &[],
             Some("work"),
+            None,
             None,
             None,
             None,
@@ -187,7 +199,7 @@ async fn real_mail_accounts_search_read() {
     assert!(!v["accounts"].as_array().unwrap().is_empty());
 
     let res = ts
-        .search("a", &[], None, None, None, Some(5), 0, 5000, true)
+        .search("a", &[], None, None, None, None, Some(5), 0, 5000, true)
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
@@ -236,6 +248,7 @@ async fn search_targets_named_mailbox_when_given() {
             &[],
             Some("Google"),
             Some("Work".into()),
+            None,
             None,
             None,
             0,
@@ -299,6 +312,7 @@ async fn search_multi_merges_folders_paginates_and_strips_bodies() {
             "invoice",
             &[],
             None,
+            None,
             2,
             1,
             None,
@@ -341,6 +355,7 @@ async fn search_multi_reports_truncation_passthrough() {
             "q",
             &[],
             None,
+            None,
             50,
             0,
             None,
@@ -365,6 +380,7 @@ async fn search_multi_grouped_mode_passthrough_and_script_flags() {
             &MailTargets::Unified,
             "application",
             &[],
+            None,
             None,
             20,
             0,
@@ -392,7 +408,7 @@ async fn search_without_terms_matches_all_and_emits_empty_term_array() {
     let env = r#"{"ok":true,"value":{"total":1,"results":[{"id":"m1","subject":"anything at all","from":"a@x","date":"2026-08-19T09:00:00Z","snippet":""}]}}"#;
     let mut f = fixture(&[env]);
     let res =
-        f.ts.search("", &[], None, None, None, Some(5), 0, 5000, false)
+        f.ts.search("", &[], None, None, None, None, Some(5), 0, 5000, false)
             .await
             .unwrap();
     let v: serde_json::Value = serde_json::from_str(&res).unwrap();
@@ -409,6 +425,7 @@ async fn any_of_terms_lowercased_into_script_as_or_set() {
         f.ts.search(
             "Application",
             &["Interview's".to_string(), "OFFER".to_string()],
+            None,
             None,
             None,
             None,
@@ -436,6 +453,7 @@ async fn scan_limit_reaches_script_in_place_of_default_cap() {
             &MailTargets::Folders(vec![("W".into(), "I".into())]),
             "",
             &[],
+            None,
             None,
             10,
             0,
@@ -597,6 +615,7 @@ async fn grouped_mode_carries_latest_ids_and_four_samples() {
             &MailTargets::Unified,
             "",
             &[],
+            None,
             None,
             20,
             0,

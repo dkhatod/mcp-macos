@@ -167,6 +167,7 @@ impl<T: AppleTransport> MailToolset<T> {
         account: Option<&str>,
         mailbox: Option<String>,
         since: Option<&str>,
+        until: Option<&str>,
         limit: Option<u32>,
         offset: u32,
         scan: u32,
@@ -180,6 +181,7 @@ impl<T: AppleTransport> MailToolset<T> {
                 account,
                 mailbox.as_deref(),
                 since,
+                until,
                 limit,
                 offset,
                 scan,
@@ -202,13 +204,19 @@ impl<T: AppleTransport> MailToolset<T> {
             }
         }
         results.truncate(limit as usize);
-        // Token diet: no offset/limit echo (the caller just sent them),
-        // `truncated` only when true.
-        let mut payload = json!({ "total": total, "results": results });
+        // Token diet (no offset/limit echo; truncated only when true) and
+        // one record per line so client compactors drop whole records
+        // instead of slicing a single giant JSON line mid-array.
+        let mut payload = format!(
+            "{{\"total\":{},\"results\":[\n{}\n]}}",
+            total,
+            crate::util::join_rows(&results)
+        );
         if timed_out {
-            payload["truncated"] = json!(true);
+            payload.pop();
+            payload.push_str(",\"truncated\":true}}");
         }
-        Ok(payload.to_string())
+        Ok(payload)
     }
 
     /// Searches one or more targets with a SINGLE script and merges the
@@ -232,6 +240,7 @@ impl<T: AppleTransport> MailToolset<T> {
         query: &str,
         any_of: &[String],
         since: Option<&str>,
+        until: Option<&str>,
         limit: u32,
         offset: u32,
         group: Option<MailGroupBy>,
@@ -240,7 +249,7 @@ impl<T: AppleTransport> MailToolset<T> {
     ) -> Result<String, AppleError> {
         let v = self
             .run_search_json(&search_multi_expr(
-                targets, query, any_of, since, limit, offset, group, scan, snippets,
+                targets, query, any_of, since, until, limit, offset, group, scan, snippets,
             ))
             .await?;
 
@@ -250,20 +259,17 @@ impl<T: AppleTransport> MailToolset<T> {
             .cloned()
             .unwrap_or_else(|| json!({}));
         let truncated = v.get("truncated").and_then(Value::as_bool).unwrap_or(false);
+        let truncated_field = if truncated { ",\"truncated\":true" } else { "" };
         if let Some(groups) = v.get("groups").cloned() {
-            let mut payload = json!({
-                "total": total,
-                "total_groups": v
-                    .get("total_groups")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-                "groups": groups,
-                "scanned_per_folder": scanned,
-            });
-            if truncated {
-                payload["truncated"] = json!(true);
-            }
-            return Ok(payload.to_string());
+            let groups = groups.as_array().cloned().unwrap_or_default();
+            return Ok(format!(
+                "{{\"total\":{},\"total_groups\":{},\"groups\":[\n{}\n],\"scanned_per_folder\":{}{}}}",
+                total,
+                v.get("total_groups").and_then(Value::as_u64).unwrap_or(0),
+                crate::util::join_rows(&groups),
+                scanned,
+                truncated_field
+            ));
         }
         let mut results = v
             .get("results")
@@ -279,15 +285,13 @@ impl<T: AppleTransport> MailToolset<T> {
             }
         }
         results.truncate(limit as usize);
-        let mut payload = json!({
-            "total": total,
-            "results": results,
-            "scanned_per_folder": scanned,
-        });
-        if truncated {
-            payload["truncated"] = json!(true);
-        }
-        Ok(payload.to_string())
+        Ok(format!(
+            "{{\"total\":{},\"results\":[\n{}\n],\"scanned_per_folder\":{}{}}}",
+            total,
+            crate::util::join_rows(&results),
+            scanned,
+            truncated_field
+        ))
     }
 
     /// Reads one full message by id (from `search` results). `folder`
@@ -394,6 +398,22 @@ impl<T: AppleTransport> MailToolset<T> {
 // Each builder returns a single JS *expression* (an arrow IIFE) embedded by
 // `wrap_jxa`. User text enters only through `js_str`.
 
+/// Shared date-window preamble for search scripts: `since` floor,
+/// `until` exclusive ceiling (both optional ISO 8601; native JS Date).
+fn date_window_clause(since: Option<&str>, until: Option<&str>) -> String {
+    format!(
+        "const sinceMs = {};\n  const untilMs = {};",
+        match since {
+            Some(iso) => format!("Date.parse({})", js_str(iso)),
+            None => "null".to_string(),
+        },
+        match until {
+            Some(iso) => format!("Date.parse({})", js_str(iso)),
+            None => "null".to_string(),
+        }
+    )
+}
+
 /// Emits the lowercased OR-term array shared by both search builders.
 /// Empty array = match-all (census) mode; every message matches.
 fn terms_js(query: &str, any_of: &[String]) -> String {
@@ -462,6 +482,7 @@ fn search_expr(
     account: Option<&str>,
     mailbox: Option<&str>,
     since: Option<&str>,
+    until: Option<&str>,
     limit: u32,
     offset: u32,
     scan: u32,
@@ -490,18 +511,22 @@ fn search_expr(
     // All narrowing happens in JS over one bulk metadata fetch — Mail-side
     // `whose` results cannot take bulk property gets, and per-item
     // specifier access re-evaluates the query (times out on large boxes).
-    let since_clause = match since {
-        Some(iso) => format!("const sinceMs = Date.parse({});", js_str(iso)),
-        None => "const sinceMs = null;".to_string(),
-    };
+    let window_clause = date_window_clause(since, until);
     format!(
         r#"(() => {{
   const M = Application('Mail');
   {account_clause}
-  {since_clause}
+  {window_clause}
   const BUDGET_MS = {GLOBAL_BUDGET_MS};
   const t0 = Date.now();
   let timedOut = false;
+  function in_window(d, lo, hi) {{
+    if (!d) return lo === null && hi === null;
+    const t = d.getTime();
+    if (lo !== null && t < lo) return false;
+    if (hi !== null && t >= hi) return false;
+    return true;
+  }}
   const scan = Math.min(box.messages.length, {scan});
   const ids = box.messages.id().slice(0, scan);
   const subjects = box.messages.subject().slice(0, scan);
@@ -510,7 +535,7 @@ fn search_expr(
   const TERMS = {terms_js};
   const idx = [];
   for (let i = 0; i < ids.length; i++) {{
-    if (sinceMs !== null && (!dates[i] || dates[i].getTime() < sinceMs)) continue;
+    if (!in_window(dates[i], sinceMs, untilMs)) continue;
     if (TERMS.length === 0 || TERMS.some(t =>
         (subjects[i] && subjects[i].toLowerCase().includes(t)) ||
         (senders[i] && senders[i].toLowerCase().includes(t)))) idx.push(i);
@@ -551,6 +576,7 @@ fn search_multi_expr(
     query: &str,
     any_of: &[String],
     since: Option<&str>,
+    until: Option<&str>,
     limit: u32,
     offset: u32,
     group: Option<MailGroupBy>,
@@ -558,10 +584,7 @@ fn search_multi_expr(
     snippets: bool,
 ) -> String {
     let terms_js = terms_js(query, any_of);
-    let since_clause = match since {
-        Some(iso) => format!("const sinceMs = Date.parse({});", js_str(iso)),
-        None => "const sinceMs = null;".to_string(),
-    };
+    let window_clause = date_window_clause(since, until);
     let targets_js = match targets {
         MailTargets::Unified => "[{u: true}]".to_string(),
         MailTargets::Folders(pairs) => {
@@ -584,7 +607,14 @@ fn search_multi_expr(
   const t0 = Date.now();
   const GROUP = {group_js};
   const SNIPPETS = {snippets};
-  {since_clause}
+  function in_window(d, lo, hi) {{
+    if (!d) return lo === null && hi === null;
+    const t = d.getTime();
+    if (lo !== null && t < lo) return false;
+    if (hi !== null && t >= hi) return false;
+    return true;
+  }}
+  {window_clause}
   const TERMS = {terms_js};
   const targets = {targets_js};
   const merged = [];
@@ -616,7 +646,7 @@ fn search_multi_expr(
     const senders = box.messages.sender().slice(0, scan);
     const dates = box.messages.dateReceived().slice(0, scan);
     for (let i = 0; i < ids.length; i++) {{
-      if (sinceMs !== null && (!dates[i] || dates[i].getTime() < sinceMs)) continue;
+      if (!in_window(dates[i], sinceMs, untilMs)) continue;
       if (TERMS.length === 0 || TERMS.some(t =>
           (subjects[i] && subjects[i].toLowerCase().includes(t)) ||
           (senders[i] && senders[i].toLowerCase().includes(t)))) {{
@@ -916,6 +946,7 @@ mod tests {
             Some("work"),
             None,
             None,
+            None,
             20,
             0,
             5000,
@@ -934,6 +965,7 @@ mod tests {
             "O'Brien",
             &[],
             Some("2026-08-01T00:00:00Z"),
+            None,
             20,
             40,
             None,
@@ -953,6 +985,7 @@ mod tests {
             &MailTargets::Unified,
             "x",
             &[],
+            None,
             None,
             10,
             0,

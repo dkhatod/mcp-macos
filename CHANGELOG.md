@@ -5,6 +5,21 @@ versions are semver (0.x: breaking changes bump minor).
 
 ## [Unreleased]
 
+### Added
+- `until` parameter on `mail_search` (exclusive upper bound) — bounded
+  date windows without post-filtering.
+- Row-per-line payloads: array results serialize one record per line so
+  client-side output compactors drop whole records instead of slicing a
+  single giant JSON line mid-stream (observed with OMP's compactor).
+  Valid JSON; zero contract change.
+- MCP **prompts**: `triage-mail-workflow` — the census-first recipe is now
+  surfaced through the client's prompt UI instead of relying on agents
+  following tool descriptions.
+- MCP **resources**: the configured state directory is exposed as
+  `file://…` resources (`job-apps.json`, `events.jsonl`, …) with
+  path-confinement and a 256 KiB read cap, so agents can discover state
+  without filesystem access or path guessing.
+
 ### Changed
 - Token diet across every tool payload: caller-supplied `offset`/`limit`
   are no longer echoed back; `truncated:false` is omitted (present only

@@ -60,7 +60,7 @@ impl<T: AppleTransport> CalendarToolset<T> {
     ) -> Result<String, AppleError> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let v = run_jxa_json(&mut self.transport, &read_expr(start, end, limit, offset)).await?;
-        Ok(v.to_string())
+        Ok(crate::util::unwrap_string_payload(v)?.to_string())
     }
 
     /// Creates an event. `calendar` names the target (default: first
@@ -215,7 +215,8 @@ fn read_expr(start: Option<String>, end: Option<String>, limit: u32, offset: u32
       }});
     }} catch (err) {{}}
   }}
-  return {{total: total, offset: {offset}, limit: {limit}, events: out}};
+  const rows = out.map(e => JSON.stringify(e)).join(',\n');
+  return '{{"total":' + total + ',"events":[\n' + rows + '\n]}}';
 }})()"#
     )
 }

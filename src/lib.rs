@@ -330,6 +330,7 @@ impl MacosServer {
                     p.account.as_deref(),
                     None,
                     p.since.as_deref(),
+                    p.until.as_deref(),
                     p.limit,
                     p.offset.unwrap_or(0),
                     scan,
@@ -392,6 +393,7 @@ impl MacosServer {
                 terms.first().map(String::as_str).unwrap_or(""),
                 &terms.iter().skip(1).cloned().collect::<Vec<_>>(),
                 p.since.as_deref(),
+                p.until.as_deref(),
                 limit,
                 p.offset.unwrap_or(0),
                 group,
@@ -860,6 +862,29 @@ impl MacosServer {
     }
 }
 
+/// The email-triage workflow shipped as an MCP prompt so small local
+/// models get the recipe through their client UI instead of hoping they
+/// follow tool descriptions.
+const MAIL_TRIAGE_PROMPT: &str = r#"You are triaging the user's mailbox. Follow this exact recipe:
+
+1. CENSUS (one call): mail_search with folders:["*"], group_by:"sender",
+   include_snippets:false, limit:100, and since set to the last refresh
+   from ~/.personai/state/job-apps.json if it exists (else omit).
+2. DRILL DOWN: a sender group is an INDEX ENTRY, not an application — big
+   ATS senders span many postings/orders/threads. For each high-signal
+   sender: mail_search(query:"<sender-key>", folders:[same], limit:50) in
+   row mode; use latest_ids/sample_subjects to pick distinct threads.
+3. READ BY EXCEPTION (mail_read id, folder): receipts and obvious noise
+   need no read. Read assessment invites, status updates, anything
+   ambiguous. Pass the folder tag exactly as the row shows it.
+4. RECORD: update ~/.personai/state/<topic>.json (one record per entity,
+   not per sender), append a summary event to events.jsonl, rewrite the
+   human-readable markdown summary.
+5. REPORT: lead with items needing user action and their deadlines.
+
+Rules: never keyword-fan-out per company; never report one status per
+sender without drill-down; disclose your coverage window."#;
+
 /// The ServerHandler impl. `#[tool_handler]` generates `call_tool` /
 /// `get_tool` / `get_info` from the router; `list_tools` is written by hand
 /// below.
@@ -891,6 +916,132 @@ impl rmcp::ServerHandler for MacosServer {
             ttl_ms: supports_cache_hints.then_some(0),
             cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
         })
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, rmcp::ErrorData> {
+        let mut out = rmcp::model::ListPromptsResult::default();
+        let mut p = rmcp::model::Prompt::new(
+            "triage-mail-workflow",
+            Some(
+                "Census-first email triage recipe: sweep every folder, drill down per sender, read by exception, persist state",
+            ),
+            None,
+        );
+        p.title = Some("Mail triage workflow".into());
+        out.prompts = vec![p];
+        Ok(out)
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, rmcp::ErrorData> {
+        match request.name.as_str() {
+            "triage-mail-workflow" => {
+                let mut result =
+                    rmcp::model::GetPromptResult::new(vec![rmcp::model::PromptMessage::new_text(
+                        rmcp::model::Role::User,
+                        MAIL_TRIAGE_PROMPT,
+                    )]);
+                result.description = Some("Census-first mail triage recipe".to_string());
+                Ok(result.into())
+            }
+            _ => Err(rmcp::ErrorData::method_not_found::<
+                rmcp::model::GetPromptRequestMethod,
+            >()),
+        }
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, rmcp::ErrorData> {
+        let mut out = rmcp::model::ListResourcesResult::default();
+        let mut resources = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&self.state_dir) {
+            for e in rd.flatten() {
+                let path = e.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("");
+                if !matches!(ext, "json" | "jsonl" | "md") {
+                    continue;
+                }
+                let Ok(meta) = e.metadata() else { continue };
+                if !meta.is_file() {
+                    continue;
+                }
+                let mut r = rmcp::model::Resource::new(
+                    format!("file://{}", path.display()),
+                    name.to_string(),
+                );
+                r.mime_type = Some(
+                    match ext {
+                        "json" => "application/json",
+                        "jsonl" => "application/x-ndjson",
+                        _ => "text/markdown",
+                    }
+                    .to_string(),
+                );
+                r.size = meta.len().into();
+                resources.push(r);
+            }
+        }
+        resources.sort_by(|a, b| a.name.cmp(&b.name));
+        out.resources = resources;
+        Ok(out)
+    }
+
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, rmcp::ErrorData> {
+        let uri = request.uri.to_string();
+        let raw = uri
+            .strip_prefix("file://")
+            .ok_or_else(|| rmcp::ErrorData::invalid_params("only file:// state URIs", None))?;
+        let path = std::path::PathBuf::from(raw);
+        let canon = path.canonicalize().map_err(|e| {
+            rmcp::ErrorData::invalid_params(format!("no such state resource: {e}"), None)
+        })?;
+        if !canon.starts_with(&self.state_dir) {
+            return Err(rmcp::ErrorData::invalid_params(
+                "resource outside the configured state directory",
+                None,
+            ));
+        }
+        let bytes = std::fs::read(&canon).map_err(|e| {
+            rmcp::ErrorData::invalid_params(format!("unreadable resource: {e}"), None)
+        })?;
+        if bytes.len() > 262_144 {
+            return Err(rmcp::ErrorData::invalid_params(
+                "resource larger than 256 KiB — read it with file tools instead",
+                None,
+            ));
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let mime = match canon.extension().and_then(|x| x.to_str()) {
+            Some("json") => "application/json",
+            Some("jsonl") => "application/x-ndjson",
+            _ => "text/markdown",
+        };
+        Ok(rmcp::model::ReadResourceResult::new(vec![
+            rmcp::model::ResourceContents::TextResourceContents {
+                uri: uri.clone(),
+                mime_type: Some(mime.to_string()),
+                text,
+                meta: None,
+            },
+        ])
+        .into())
     }
 }
 #[derive(Deserialize, JsonSchema)]
@@ -926,6 +1077,10 @@ pub struct MailSearchParams {
     /// Optional ISO 8601 date; only messages received after this instant.
     #[serde(default)]
     pub since: Option<String>,
+    /// Optional ISO 8601 date; only messages received BEFORE this instant
+    /// (exclusive). Pair with since for bounded windows.
+    #[serde(default)]
+    pub until: Option<String>,
     /// Page size (default 20, max 100).
     #[serde(default)]
     pub limit: Option<u32>,

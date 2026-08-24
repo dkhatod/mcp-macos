@@ -63,7 +63,7 @@ impl<T: AppleTransport> MessagesToolset<T> {
     pub async fn chats(&mut self, limit: Option<u32>, offset: u32) -> Result<String, AppleError> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let v = run_jxa_json(&mut self.transport, &chats_expr(limit, offset)).await?;
-        Ok(v.to_string())
+        Ok(crate::util::unwrap_string_payload(v)?.to_string())
     }
 
     /// Sends an iMessage/SMS. Soft-gated like [`crate::mail::MailToolset::send`].
@@ -190,7 +190,8 @@ fn chats_expr(limit: u32, offset: u32) -> String {
             handle: handle, message_count: Number(message_count) || 0,
             last_activity: last_activity}};
   }});
-  return {{total: total, chats: chats}};
+  const rowJson = chats.map(c => JSON.stringify(c)).join(',\n');
+  return '{{"total":' + total + ',"chats":[\n' + rowJson + '\n]}}';
 }})()"#,
         js_str(&cmd),
     )

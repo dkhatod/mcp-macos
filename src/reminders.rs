@@ -76,7 +76,7 @@ impl<T: AppleTransport> RemindersToolset<T> {
             &read_expr(list.as_deref(), include_completed, limit, offset),
         )
         .await?;
-        Ok(v.to_string())
+        Ok(crate::util::unwrap_string_payload(v)?.to_string())
     }
 
     /// Creates a reminder. Soft-gated.
@@ -179,7 +179,8 @@ fn read_expr(list: Option<&str>, include_completed: bool, limit: u32, offset: u3
     if (done) r.completed = !!done[i];
     out.push(r);
   }}
-  return {{total: total, offset: {offset}, limit: {limit}, reminders: out}};
+  const rows = out.map(r => JSON.stringify(r)).join(',\n');
+  return '{{"total":' + total + ',"reminders":[\n' + rows + '\n]}}';
 }})()"#,
         container_clause(list),
     )
