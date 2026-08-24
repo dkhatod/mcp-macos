@@ -11,6 +11,8 @@ versions are semver (0.x: breaking changes bump minor).
   `mail_search` at JXA parse time and nulling group folder tags. Both are
   now guarded by new contract tests (script balance oracle + folder
   provenance assertion) so this failure class cannot recur silently.
+- Items-after-test-module warning: `join_rows`/`unwrap_string_payload`
+  moved above `mod tests` in `src/util.rs`; clippy is warning-free.
 
 ### Added
 - `until` parameter on `mail_search` (exclusive upper bound) — bounded
@@ -26,6 +28,22 @@ versions are semver (0.x: breaking changes bump minor).
   `file://…` resources (`job-apps.json`, `events.jsonl`, …) with
   path-confinement and a 256 KiB read cap, so agents can discover state
   without filesystem access or path guessing.
+- Syntax-oracle CI tier: every generated JXA script (all five tool
+  groups' builders) is compile-checked with `/usr/bin/osacompile -l
+  JavaScript` — which compiles without executing, so no app access or
+  TCC prompts — in a new `syntax-oracle` GitHub Actions job on
+  macos-latest (`tests/syntax_oracle.rs`).
+- Balance-oracle coverage across all tool groups: the paren/brace script
+  balance check (now a JS-aware lexer handling strings, template
+  literals, comments, and regex literals) runs over messages
+  (`read`/`chats`/`send`), contacts (`search`), reminders
+  (`lists`/`read`/`create`/`complete`), and calendar
+  (`read`/`create`/`update`/`delete`) generated scripts.
+- `MCP_MACOS_DEBUG_RAW=1` diagnostic: when `messages_read` fails to
+  parse the `{ok,value}` envelope (the live "trailing characters"
+  quirk), the raw osascript stdout is re-captured and dumped to stderr
+  (first 500 + last 300 chars + total length) so the user can share it;
+  zero cost when the env var is unset.
 
 ### Changed
 - Token diet across every tool payload: caller-supplied `offset`/`limit`
