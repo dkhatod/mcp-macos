@@ -553,7 +553,13 @@ fn search_expr(
       from: senders[i],
       date: dates[i].toISOString().slice(0, 19) + 'Z',
     }};
-    if ({snippets}) {{ try {{ const s = String(m.content()).slice(0, 140); if (s) row.snippet = s; }} catch (e) {{}} }}
+    if ({snippets}) {{ try {{
+      const c = String(m.content());
+      let pos = 0;
+      for (const t of TERMS) {{ const i = c.toLowerCase().indexOf(t); if (i >= 0) {{ pos = Math.max(0, i - 60); break; }} }}
+      const s = c.slice(pos, pos + 140).trim();
+      if (s) row.snippet = s;
+    }} catch (e) {{}} }}
     out.push(row);
   }}
   const ret = {{total: total, results: out}};
@@ -710,7 +716,13 @@ fn search_multi_expr(
     if (Date.now() - t0 > BUDGET_MS) {{ truncated = true; break; }}
     const e = merged[k];
     const row = {{ id: e.id, subject: e.subject, from: e.from, date: e.date, folder: e.folder }};
-    if (SNIPPETS) {{ try {{ const s = String(e.ref.content()).slice(0, 140); if (s) row.snippet = s; }} catch (err) {{}} }}
+    if (SNIPPETS) {{ try {{
+      const c = String(e.ref.content());
+      let pos = 0;
+      for (const t of TERMS) {{ const i = c.toLowerCase().indexOf(t); if (i >= 0) {{ pos = Math.max(0, i - 60); break; }} }}
+      const s = c.slice(pos, pos + 140).trim();
+      if (s) row.snippet = s;
+    }} catch (err) {{}} }}
     out.push(row);
   }}
   const ret = {{total: total, results: out, scanned_per_folder: scannedPerFolder}};

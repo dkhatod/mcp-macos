@@ -648,3 +648,24 @@ async fn read_accepts_unified_inbox_tag_from_search_rows() {
         "unified tag must not resolve as a real account: {script}"
     );
 }
+
+#[tokio::test]
+async fn snippets_center_on_first_matching_term() {
+    // Status words live mid-body ("we regret to inform you…"); a snippet
+    // from char 0 misses them. When terms exist and snippets are on, the
+    // window must center on the first term hit instead of the body head.
+    let mut f = fixture(&[r#"{"ok":true,"value":{"total":0,"results":[]}}"#]);
+    let _ =
+        f.ts.search("regret", &[], None, None, None, None, None, 0, 5000, true)
+            .await
+            .unwrap();
+    let script = &f.ts.transport.calls()[0].script;
+    assert!(
+        script.contains("indexOf(t)"),
+        "snippet must locate first term hit: {script}"
+    );
+    assert!(
+        script.contains("Math.max(0,"),
+        "window must back up before the hit: {script}"
+    );
+}

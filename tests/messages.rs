@@ -127,3 +127,33 @@ async fn real_messages_read() {
         }
     }
 }
+
+#[tokio::test]
+async fn read_unwraps_preserialized_row_per_line_payload() {
+    // Real path: the JXA builder returns its payload as a STRING (one row
+    // per line); the envelope carries it as Value::String and the toolset
+    // must re-parse so callers get an object, never a quoted JSON blob.
+    let inner = "{\"total\":2,\"messages\":[\n{\"from\":\"+1555\",\"direction\":\"in\",\"text\":\"hi\",\"date\":\"2026-08-23T12:00:00Z\"},\n{\"from\":\"me\",\"direction\":\"out\",\"text\":\"yo\",\"date\":\"2026-08-23T12:01:00Z\"}\n]}";
+    let env = format!(
+        r#"{{"ok":true,"value":{}}}"#,
+        serde_json::to_string(inner).unwrap()
+    );
+    let mut f = fixture(&[&env]);
+    let v: serde_json::Value =
+        serde_json::from_str(&f.ts.read(None, Some(3), 0).await.unwrap()).unwrap();
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn chats_unwraps_preserialized_payload() {
+    let inner = "{\"total\":1,\"chats\":[\n{\"identifier\":\"+1555\",\"display_name\":\"Mom\",\"service\":\"iMessage\",\"handle\":\"+1555\",\"message_count\":9,\"last_activity\":\"2026-08-23T09:00:00Z\"}\n]}";
+    let env = format!(
+        r#"{{"ok":true,"value":{}}}"#,
+        serde_json::to_string(inner).unwrap()
+    );
+    let mut f = fixture(&[&env]);
+    let v: serde_json::Value =
+        serde_json::from_str(&f.ts.chats(Some(20), 0).await.unwrap()).unwrap();
+    assert_eq!(v["chats"][0]["display_name"], "Mom");
+}

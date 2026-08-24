@@ -55,7 +55,7 @@ impl<T: AppleTransport> MessagesToolset<T> {
             &read_expr(chat.as_deref(), limit, offset),
         )
         .await?;
-        Ok(v.to_string())
+        Ok(crate::util::unwrap_string_payload(v)?.to_string())
     }
 
     /// Lists chats (identifier, display name, service, sample handle,
@@ -149,9 +149,10 @@ fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
     const [from, direction, text, date] = line.split('|||');
     return {{from: from, direction: direction, text: text || '', date: date}};
   }});
-  const ret = {{total: total, messages: messages}};
-  if (messages.length < {}) ret.more = true;
-  return ret;
+  const rowJson = messages.map(m => JSON.stringify(m)).join(',\n');
+  let payload = '{{"total":' + total + ',"messages":[\n' + rowJson + '\n]}}';
+  if (messages.length < {}) payload += ',"more":true';
+  return payload;
 }})()"#,
         js_str(&cmd),
         limit,
