@@ -175,6 +175,23 @@ fn groups_collapse_senders_like_live_mode() {
     // Single-message groups follow by last desc: 306 (08-18) is oldest → last.
     let keys: Vec<&str> = groups.iter().map(|g| g["key"].as_str().unwrap()).collect();
     assert_eq!(keys.last().unwrap(), &"reject@corp.com");
+    // THE multi-posting signal: amazon sent 2 messages with 2 DISTINCT
+    // normalized subjects ⇒ distinct_subjects tells the agent how many
+    // threads exist behind one sender, even though samples cap at 4.
+    assert_eq!(groups[0]["distinct_subjects"], 2);
+}
+
+#[test]
+fn subject_groups_omit_distinct_signal() {
+    let h = seeded("gsub.db");
+    let empty: Vec<String> = vec![];
+    let out = search_index(&h, &q(&empty, None, Some(MailGroupBy::Subject), 20, 0)).unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let g = v["groups"].as_array().unwrap();
+    assert!(
+        g.iter().all(|x| x.get("distinct_subjects").is_none()),
+        "distinct_subjects is a sender-mode-only field"
+    );
 }
 
 #[test]

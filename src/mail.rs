@@ -678,13 +678,14 @@ fn search_multi_expr(
       const key = GROUP === 'sender' ? addrOf(e.from) : normSub(e.subject);
       let g = map.get(key);
       if (!g) {{
-        g = {{ key: key, name: nameOf(e.from), count: 0, first_ms: e.ms, first: e.date, last_ms: e.ms, last: e.date, latest_id: e.id, latest_ids: [], samples: [], folders: [] }};
+        g = {{ key: key, name: nameOf(e.from), count: 0, first_ms: e.ms, first: e.date, last_ms: e.ms, last: e.date, latest_id: e.id, latest_ids: [], samples: [], folders: [], _seen: new Set() }};
         map.set(key, g);
       }}
       g.count++;
       if (e.ms < g.first_ms) {{ g.first_ms = e.ms; g.first = e.date; }}
       if (e.ms > g.last_ms) {{ g.last_ms = e.ms; g.last = e.date; g.latest_id = e.id; }}
       const ns = normSub(e.subject);
+      if (GROUP === 'sender') g._seen.add(ns);
       if (g.latest_ids.length < 3) g.latest_ids.push(e.id);
       if (g.samples.length < 4 && !g.samples.some(x => normSub(x) === ns)) g.samples.push(String(e.subject == null ? '' : e.subject));
       if (g.folders.length < 3 && !g.folders.includes(e.folder)) g.folders.push(e.folder);
@@ -706,6 +707,7 @@ fn search_multi_expr(
         latest_ids: g.latest_ids,
         sample_subjects: g.samples,
         folders: g.folders,
+        distinct_subjects: GROUP === 'sender' ? g._seen.size : undefined,
       }});
     }}
     const ret = {{total: total, total_groups: totalGroups, groups: page, scanned_per_folder: scannedPerFolder}};
@@ -1060,6 +1062,23 @@ mod tests {
         assert!(s.contains("Math.min(box.messages.length, 1000)"), "{s}");
         // Terms are lowercased then escaped like search_expr.
         assert!(s.contains(r#"["o'brien"]"#), "{s}");
+
+        // Sender-grouped scripts must carry the distinct-thread counter:
+        // big ATS senders span many postings and samples cap at 4.
+        let grouped = search_multi_expr(
+            &MailTargets::Folders(vec![("A".into(), "B".into())]),
+            "",
+            &[],
+            None,
+            None,
+            20,
+            0,
+            Some(MailGroupBy::Sender),
+            5000,
+            false,
+        );
+        assert!(grouped.contains("distinct_subjects"), "{grouped}");
+        assert!(grouped.contains("_seen"), "{grouped}");
 
         let u = search_multi_expr(
             &MailTargets::Unified,

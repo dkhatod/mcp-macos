@@ -5,6 +5,24 @@ versions are semver (0.x: breaking changes bump minor).
 
 ## [Unreleased]
 
+## [0.1.9] — 2026-08-24
+
+### Fixed
+- **Under-counted applications in triage runs**: sender groups now carry
+  `distinct_subjects` — the number of distinct normalized subjects behind
+  one sender (live and index modes; sender grouping only). Big ATS senders
+  span many postings from one address (`noreply@mail.amazon.jobs` carries
+  every Amazon role); `sample_subjects` caps at 4, so nothing previously
+  signalled "this group hides more threads". Agents now have the exact
+  drill-down condition.
+- Server `instructions` routed triage to plain `mail_search → mail_read`,
+  so small local models never discovered `mail_sync`/`source:"index"`, ran
+  budget-bound live sweeps over default folders, and skipped drill-down.
+  Routing now prescribes sync → indexed census → distinct_subjects-driven
+  drill-down. `triage-mail-workflow` prompt rewritten the same way.
+- Server version string is now derived from `CARGO_PKG_VERSION` instead of
+  a hardcoded literal that had drifted (reported 0.1.7 through 0.1.8).
+
 ## [0.1.8] — 2026-08-24
 
 ### Added

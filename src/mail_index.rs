@@ -482,6 +482,7 @@ pub fn search_index(h: &IndexHandle, q: &IndexQuery) -> Result<String, IndexErro
                 latest_ids: Vec<String>,
                 samples: Vec<String>,
                 folders: Vec<String>,
+                seen: std::collections::HashSet<String>,
             }
             let mut map: std::collections::HashMap<String, G> = std::collections::HashMap::new();
             for e in &all {
@@ -503,6 +504,7 @@ pub fn search_index(h: &IndexHandle, q: &IndexQuery) -> Result<String, IndexErro
                     latest_ids: Vec::new(),
                     samples: Vec::new(),
                     folders: Vec::new(),
+                    seen: std::collections::HashSet::new(),
                 });
                 g.count += 1;
                 if g.first.as_str() > date {
@@ -516,6 +518,9 @@ pub fn search_index(h: &IndexHandle, q: &IndexQuery) -> Result<String, IndexErro
                     g.latest_ids.push(id.to_string());
                 }
                 let ns = norm_sub(subject);
+                if matches!(group, MailGroupBy::Sender) {
+                    g.seen.insert(ns.clone());
+                }
                 if g.samples.len() < 4 && !g.samples.iter().any(|x| norm_sub(x) == ns) {
                     g.samples.push(subject.to_string());
                 }
@@ -535,7 +540,7 @@ pub fn search_index(h: &IndexHandle, q: &IndexQuery) -> Result<String, IndexErro
             let page: Vec<Value> = groups[start..end]
                 .iter()
                 .map(|(key, g)| {
-                    json!({
+                    let mut row = json!({
                         "key": key,
                         "name": if matches!(group, MailGroupBy::Sender) { g.name.clone() } else { key.clone() },
                         "count": g.count,
@@ -545,7 +550,14 @@ pub fn search_index(h: &IndexHandle, q: &IndexQuery) -> Result<String, IndexErro
                         "latest_ids": g.latest_ids,
                         "sample_subjects": g.samples,
                         "folders": g.folders,
-                    })
+                    });
+                    // Sender-mode-only signal: how many distinct threads hide
+                    // behind one sender (big ATS senders span many postings;
+                    // samples cap at 4). Absent entirely in subject mode.
+                    if matches!(group, MailGroupBy::Sender) {
+                        row["distinct_subjects"] = json!(g.seen.len());
+                    }
+                    row
                 })
                 .collect();
             Ok(json!({

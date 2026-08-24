@@ -1010,23 +1010,33 @@ impl MacosServer {
 /// follow tool descriptions.
 const MAIL_TRIAGE_PROMPT: &str = r#"You are triaging the user's mailbox. Follow this exact recipe:
 
-1. CENSUS (one call): mail_search with folders:["*"], group_by:"sender",
-   include_snippets:false, limit:100, and since set to the last refresh
-   from ~/.personai/state/job-apps.json if it exists (else omit).
-2. DRILL DOWN: a sender group is an INDEX ENTRY, not an application — big
-   ATS senders span many postings/orders/threads. For each high-signal
-   sender: mail_search(query:"<sender-key>", folders:[same], limit:50) in
-   row mode; use latest_ids/sample_subjects to pick distinct threads.
-3. READ BY EXCEPTION (mail_read id, folder): receipts and obvious noise
-   need no read. Read assessment invites, status updates, anything
-   ambiguous. Pass the folder tag exactly as the row shows it.
-4. RECORD: update ~/.personai/state/<topic>.json (one record per entity,
-   not per sender), append a summary event to events.jsonl, rewrite the
-   human-readable markdown summary.
-5. REPORT: lead with items needing user action and their deadlines.
+1. SYNC (once per session): mail_sync with folders:["*"]. This fills the
+   local index; every later search runs instantly against it.
+2. CENSUS (one call): mail_search with source:"index", folders:["*"],
+   group_by:"sender", limit:100, and since set to the last refresh noted in
+   ~/.personai/state/job-apps.json if it exists (else omit). The response
+   carries data_as_of — cite it as your coverage window. If total_groups
+   exceeds the returned page, paginate with offset until covered.
+3. DRILL DOWN — THE STEP THAT FINDS EVERY ROLE: a sender group is an INDEX
+   ENTRY, not one application. Big ATS senders span MANY postings (e.g.
+   noreply@mail.amazon.jobs carries every Amazon role). For ANY sender where
+   distinct_subjects is greater than sample_subjects.length, you MUST
+   enumerate its threads:
+   mail_search(source:"index", query:"<sender-key>", folders:[same],
+   limit:50) in row mode or with group_by:"subject". Each distinct
+   normalized subject = one application candidate. Never report one status
+   per sender without this step.
+4. READ BY EXCEPTION (mail_read id, folder): receipts and rejections need
+   no read. Read assessment invites, status updates, anything ambiguous.
+   Pass the folder tag exactly as the row shows it.
+5. RECORD: update ~/.personai/state/<topic>.json (one record per entity,
+   not per sender), append a summary event to events.jsonl (or run
+   personai-core state log '{...}'), rewrite the human-readable summary.
+6. REPORT: lead with items needing user action and their deadlines.
 
-Rules: never keyword-fan-out per company; never report one status per
-sender without drill-down; disclose your coverage window."#;
+Rules: never keyword-fan-out per company; never trust sample_subjects alone
+— they cap at 4 while distinct_subjects counts everything; disclose your
+coverage window."#;
 
 /// The ServerHandler impl. `#[tool_handler]` generates `call_tool` /
 /// `get_tool` / `get_info` from the router; `list_tools` is written by hand
@@ -1034,8 +1044,10 @@ sender without drill-down; disclose your coverage window."#;
 #[tool_handler(
     router = Self::tool_router(),
     name = "mcp-macos",
-    version = "0.1.7",
-    instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> mail_search then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update/calendar_delete; recipient names (people) -> contacts_search first, chat handles -> messages_chats first; task items -> reminders_read/reminders_create/reminders_complete; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
+    // NOTE: attribute macros require a literal here. tests/version_parity.rs
+    // fails the build if this drifts from Cargo.toml.
+    version = "0.1.9",
+    instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> FIRST mail_sync(folders:[\"*\"]) to refresh the local index, THEN mail_search(source:\"index\", folders:[\"*\"], group_by:\"sender\") as the census; a sender group is NOT one application — when distinct_subjects exceeds sample_subjects.length for a sender (big ATS senders like amazon.jobs span many postings), drill down with mail_search(source:\"index\", query:\"<sender-key>\", folders:[same], group_by:\"subject\") before reporting, then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update/calendar_delete; recipient names (people) -> contacts_search first, chat handles -> messages_chats first; task items -> reminders_read/reminders_create/reminders_complete; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
 )]
 impl rmcp::ServerHandler for MacosServer {
     async fn list_tools(
