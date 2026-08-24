@@ -661,6 +661,7 @@ fn search_multi_expr(
           subject: subjects[i],
           from: senders[i],
           date: dates[i].toISOString().slice(0, 19) + 'Z',
+          folder: label,
           ref: box.messages[i],
         }});
       }}
