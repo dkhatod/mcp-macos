@@ -20,18 +20,6 @@ pub(crate) fn js_str(s: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::js_str;
-
-    #[test]
-    fn escapes_quotes_backslashes_and_control_chars() {
-        assert_eq!(js_str("a\"b\\c"), r#""a\"b\\c""#);
-        assert_eq!(js_str("line\nbreak"), "\"line\\nbreak\"");
-        assert_eq!(js_str("\u{1}"), "\"\\u0001\"");
-    }
-}
-
 /// Serializes rows one-per-line inside a JSON array so client-side output
 /// compactors degrade gracefully: they drop whole records from the middle
 /// instead of slicing through a single giant line (observed with OMP).
@@ -56,5 +44,17 @@ pub(crate) fn unwrap_string_payload(
         serde_json::Value::String(s) => serde_json::from_str(&s)
             .map_err(|e| personai_core::macos::AppleError::Parse(e.to_string())),
         other => Ok(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::js_str;
+
+    #[test]
+    fn escapes_quotes_backslashes_and_control_chars() {
+        assert_eq!(js_str("a\"b\\c"), r#""a\"b\\c""#);
+        assert_eq!(js_str("line\nbreak"), "\"line\\nbreak\"");
+        assert_eq!(js_str("\u{1}"), "\"\\u0001\"");
     }
 }
