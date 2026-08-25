@@ -7,11 +7,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out personai-core (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: dkhatod/personai-core
-          path: personai-core
+      - name: Clone personai-core next to this repo (path dependency resolves ../personai-core)
+        run: git clone --depth 1 https://github.com/dkhatod/personai-core.git ../personai-core
       - uses: dtolnay/rust-toolchain@stable
         with: { components: rustfmt, clippy }
       - run: cargo fmt --check
@@ -24,11 +21,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out personai-core (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: dkhatod/personai-core
-          path: personai-core
+      - name: Clone personai-core next to this repo (path dependency resolves ../personai-core)
+        run: git clone --depth 1 https://github.com/dkhatod/personai-core.git ../personai-core
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --test syntax_oracle
 
@@ -38,11 +32,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check out personai-core (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: dkhatod/personai-core
-          path: personai-core
+      - name: Clone personai-core next to this repo (path dependency resolves ../personai-core)
+        run: git clone --depth 1 https://github.com/dkhatod/personai-core.git ../personai-core
       - uses: dtolnay/rust-toolchain@stable
         with: { components: rustfmt, clippy }
       - run: cargo test
@@ -53,11 +44,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Check out personai-core (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: dkhatod/personai-core
-          path: personai-core
+      - name: Clone personai-core next to this repo (path dependency resolves ../personai-core)
+        run: git clone --depth 1 https://github.com/dkhatod/personai-core.git ../personai-core
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - name: Package (aarch64-apple-darwin)
