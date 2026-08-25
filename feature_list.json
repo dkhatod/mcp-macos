@@ -1,6 +1,6 @@
 {
   "project": "mcp-macos",
-  "updated": "2026-08-24",
+  "updated": "2026-08-25",
   "features": [
     {
       "id": "scaffold",
@@ -79,6 +79,30 @@
       "name": "Live acceptance: D9 benchmark table (first sync \u226490s, delta <10s, census <50ms, cached read <5ms)",
       "status": "todo",
       "evidence": "user runs per docs/tools.md; requires real Mail.app"
+    },
+    {
+      "id": "messages-index",
+      "name": "Messages corpus index: messages_sync (ROWID watermark) + messages_search (FTS5) over shared index.db",
+      "status": "done",
+      "evidence": "commit e8258b8+; tests/messages_index.rs(12) tests/messages_server_tools.rs(2); live: 347k msgs synced, search 'hackathon' 94 hits"
+    },
+    {
+      "id": "messages-triage-tools",
+      "name": "messages_unread digest + messages_attachments metadata + tapback exclusion in reads",
+      "status": "done",
+      "evidence": "tests/messages.rs 18 contracts incl hostile-text envelope; live read of Dhruv chat 251 msgs"
+    },
+    {
+      "id": "send-allowlist",
+      "name": "Optional recipient allowlist (state_dir/messages-send-allowlist.json) enforced pre-gate",
+      "status": "done",
+      "evidence": "tests/messages_allowlist.rs(3): blocks unlisted, accepts formatted phone, missing file = open"
+    },
+    {
+      "id": "live-acceptance-messages",
+      "name": "Live acceptance: messages sync delta timing + scoped search spot-checks (Dhruv-scoped only)",
+      "status": "todo",
+      "evidence": "run MCP_MESSAGES_LIVE_CHAT=<handle> cargo test --test messages_live_scoped -- --ignored"
     }
   ]
 }

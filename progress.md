@@ -3,6 +3,33 @@
 Newest entry on top. Read top-to-bottom to reconstruct state; prepend after
 each session. `feature_list.json` is the authoritative feature/status map.
 
+## 2026-08-25 — Run 5: Messages integration (index surface)
+
+**State:** Built TDD-first (8 red-green cycles), committed locally, binary
+reinstalled to ~/.cargo/bin (0.1.10, version string now parity-guarded by
+tests/version_parity.rs).
+
+**Shipped:** shared INDEX_MIGRATIONS composition; messages_sync
+(rowid-watermarked, batched, budgeted, resumable); messages_search (FTS5,
+bounded snippets, phrase-escaped MATCH); messages_unread;
+messages_attachments (metadata only); tapback exclusion in reads; optional
+send allowlist. Live verified on real chat.db: 347,467 msgs indexed,
+0 shifted rows after full rebuild, search + scoped Dhruv reads working.
+
+**Root causes fixed this run:** doShellScript CR line endings broke every
+Messages mapper since inception; separator-counting ambiguity with empty
+fields (fixed via sqlite json_object rows); control-char envelope
+corruption (sanitizer + JSON.stringify).
+
+**Verification:** cargo test 140 passed / 0 failed / 4 ignored (live
+smokes opt-in via env); fmt + clippy -D warnings clean; ./init.sh green.
+
+**Next:** live acceptance items in feature_list.json (mail D9 benchmarks +
+messages scoped spot-checks). No publishing.
+
+Newest entry on top. Read top-to-bottom to reconstruct state; prepend after
+each session. `feature_list.json` is the authoritative feature/status map.
+
 ## 2026-08-24 — Run 4: local memory layer (0.1.8)
 
 **State:** Built and committed locally; crates.io untouched (path dep on

@@ -6,8 +6,8 @@ cd "$(dirname "$0")"
 echo "== cargo fmt --check"
 cargo fmt --check
 
-echo "== cargo clippy -- -D warnings"
-cargo clippy -- -D warnings
+echo "== cargo clippy --all-targets -- -D warnings"
+cargo clippy --all-targets -- -D warnings
 
 echo "== cargo test"
 cargo test
