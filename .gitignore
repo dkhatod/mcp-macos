@@ -1,2 +1,16 @@
+# Build
 /target
+
+# macOS
+.DS_Store
+
+# Local-only notes
 /ideas.md
+
+# Secrets / environment (insurance — nothing should ever match)
+*.local
+.env
+.env.*
+
+# Test/runtime droppings
+*.profraw
