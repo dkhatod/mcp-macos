@@ -10,7 +10,7 @@ fn seeded(name: &str) -> IndexHandle {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(name);
     std::mem::forget(dir);
-    let h = IndexHandle::open(path, mcp_macos::mail_index::MAIL_MIGRATIONS).unwrap();
+    let h = IndexHandle::open(path, mcp_macos::index_schema::INDEX_MIGRATIONS).unwrap();
     // Two folders; senders with multiple threads; staggered dates.
     h.upsert(
         "mail_messages",
@@ -228,7 +228,7 @@ fn empty_index_returns_zero_totals_not_an_error() {
     let dir = tempfile::tempdir().unwrap();
     let h = IndexHandle::open(
         dir.path().join("empty.db"),
-        mcp_macos::mail_index::MAIL_MIGRATIONS,
+        mcp_macos::index_schema::INDEX_MIGRATIONS,
     )
     .unwrap();
     std::mem::forget(dir);

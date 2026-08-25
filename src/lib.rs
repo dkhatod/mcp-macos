@@ -20,6 +20,7 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 
 pub mod calendar;
+pub mod index_schema;
 pub mod clipboard;
 pub mod contacts;
 pub mod mail;
@@ -319,7 +320,7 @@ impl MacosServer {
             }
         };
         let db = self.state_dir.join("index.db");
-        let handle = match personai_core::index::IndexHandle::open(&db, mail_index::MAIL_MIGRATIONS)
+        let handle = match personai_core::index::IndexHandle::open(&db, index_schema::INDEX_MIGRATIONS)
         {
             Ok(h) => h,
             Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
@@ -361,7 +362,7 @@ impl MacosServer {
                 .to_string();
             }
             let handle =
-                match personai_core::index::IndexHandle::open(&db, mail_index::MAIL_MIGRATIONS) {
+                match personai_core::index::IndexHandle::open(&db, index_schema::INDEX_MIGRATIONS) {
                     Ok(h) => h,
                     Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
                 };

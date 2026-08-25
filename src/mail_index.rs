@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 /// column (`account || '/' || mailbox`) so partition replace and scope
 /// filters key off one indexed string. FTS5 external-content mirror is
 /// maintained by triggers — the engine never learns about it.
-pub const MAIL_MIGRATIONS: &[&str] = &[r#"
+pub const MAIL_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS mail_messages(
   account TEXT NOT NULL, mailbox TEXT NOT NULL, apple_id TEXT NOT NULL,
   fingerprint TEXT NOT NULL,
@@ -46,9 +46,13 @@ CREATE TABLE IF NOT EXISTS mail_bodies(
   cache_key TEXT PRIMARY KEY, subject TEXT, sender TEXT, date_iso TEXT,
   body TEXT NOT NULL, body_truncated INTEGER NOT NULL DEFAULT 0,
   fetched_at INTEGER NOT NULL);
-"#];
+"#;
 
 const SOURCE: &str = "mail";
+
+/// Back-compat slice for mail-only openings (tests). Production opens
+/// MUST use `index_schema::INDEX_MIGRATIONS`.
+pub const MAIL_MIGRATIONS: &[&str] = &[MAIL_V1];
 
 #[derive(Debug, Clone, Default)]
 pub struct FolderSyncStats {

@@ -11,7 +11,7 @@ fn handle(name: &str) -> IndexHandle {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(name);
     std::mem::forget(dir);
-    IndexHandle::open(path, mcp_macos::mail_index::MAIL_MIGRATIONS).unwrap()
+    IndexHandle::open(path, mcp_macos::index_schema::INDEX_MIGRATIONS).unwrap()
 }
 
 fn toolset() -> MailToolset<MockTransport> {
