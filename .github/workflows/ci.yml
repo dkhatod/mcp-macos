@@ -7,10 +7,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check out personai-core (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: dkhatod/personai-core
+          path: personai-core
       - uses: dtolnay/rust-toolchain@stable
         with: { components: rustfmt, clippy }
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
   syntax-oracle:
@@ -19,6 +24,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check out personai-core (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: dkhatod/personai-core
+          path: personai-core
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --test syntax_oracle
 
@@ -28,6 +38,11 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Check out personai-core (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: dkhatod/personai-core
+          path: personai-core
       - uses: dtolnay/rust-toolchain@stable
         with: { components: rustfmt, clippy }
       - run: cargo test
@@ -38,6 +53,11 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Check out personai-core (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: dkhatod/personai-core
+          path: personai-core
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
       - name: Package (aarch64-apple-darwin)
