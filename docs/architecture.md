@@ -184,6 +184,19 @@ Index-mode search executes filters/grouping as SQL: no Apple Events, no
 25 s budget; responses carry `data_as_of` (the watermark) instead of
 pretending freshness.
 
+The Messages surface reuses the same engine and file. Because SQLite's
+`PRAGMA user_version` is per-FILE, every opener passes ONE composed list —
+`index_schema::INDEX_MIGRATIONS` (mail v1 + messages v2); a build knowing
+fewer migrations than the file's stamp is rejected, never misread.
+
+Two hard-won encoding rules live in every chat.db/sqlite mapper:
+1. `doShellScript` returns CR-delimited text — mappers split on
+   `\r\n|\r|\n`, never bare `\n` (splitting wrong once made every live
+   read silently empty).
+2. Rows are emitted as sqlite `json_object()` per line, parsed with
+   `JSON.parse` — separator counting is ambiguous whenever a field is
+   empty or contains the separator itself.
+
 ## 6. Performance characteristics
 
 Measured on an M-series Mac, 22k-message Gmail inbox, 25 calendars:

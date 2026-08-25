@@ -82,7 +82,11 @@ $ cargo install mcp-macos        # or download a release binary
 | `mail_search` | Search message metadata (never bodies) across all accounts by default; optional account/mailbox narrowing; `group_by="sender"/"subject"` aggregates rows into counts with `latest_id` for triage; `source:"index"` queries the local cache instantly (`data_as_of` freshness marker) | auto |
 | `mail_read` | Read one full message by id — bodies cached on first read (`"cached": true`) | auto |
 | `mail_send` | Send email | soft-gated |
-| `messages_chats` | List chats (identifier, name, service, handle, last activity) for send addressing | auto |
+| `messages_sync` | Mirror chat.db history into the local index (`state_dir/index.db`) — incremental by ROWID watermark, seconds per delta | auto |
+| `messages_search` | Full-text search over ALL synced history; bounded snippets, newest first, `data_as_of` freshness marker | auto |
+| `messages_unread` | Per-chat unread counts, heaviest first — triage/digest input | auto |
+| `messages_attachments` | List attachment metadata (name/mime/bytes/date), optionally scoped to one chat; never content | auto |
+| `messages_chats` | List chats with `is_group`, participant count and up to 8 participants — resolves group vs individual before sending | auto |
 | `messages_read` | Read iMessage/SMS history from chat.db | auto |
 | `messages_send` | Send iMessage/SMS | soft-gated |
 | `contacts_search` | Search Contacts: name/org/email → id, emails, phones (read-only) | auto |

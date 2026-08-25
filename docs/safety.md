@@ -39,6 +39,14 @@ Properties:
 - Each gated group owns its own store file; single-use is enforced per
   group, which is the only scope an action name exists in.
 
+## Recipient allowlist (Messages)
+
+`state_dir/messages-send-allowlist.json` — JSON array of handles. When the
+file exists and is non-empty, `messages_send` refuses recipients outside it
+BEFORE the soft gate (defense in depth). Missing/empty file = allow all.
+Matching: emails lowercase-exact; phones digits-only with a >=7-digit
+suffix rule, so formatting differences cannot smuggle a different number.
+
 ## Hard gate (future)
 
 Irreversible actions — application submissions, deletes — will refuse

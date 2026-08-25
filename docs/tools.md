@@ -78,7 +78,7 @@ not in the inbox). Scan window: newest 1000 messages (`SCAN_MAX` in
 | folders | string[]? | `["Account/Mailbox", …]` targets, validated against the scope |
 | limit | u32? | page size, default 20, hard max 100 — prefer small pages |
 | offset | u32? | default 0 |
-| group_by | "sender"\|"subject"? | aggregate rows into `{groups:[{key,name,count,first,last,latest_id,sample_subjects,folders}]}` ordered by count; subject mode strips Re:/Fwd: chains |
+| group_by | "sender"\|"subject"? | aggregate rows into `{groups:[{key,name,count,first,last,latest_id,sample_subjects,folders,distinct_subjects}]}` ordered by count; subject mode strips Re:/Fwd: chains. **distinct_subjects counts the real threads behind one sender — when it exceeds sample_subjects.length, drill down before reporting** |
 | include_snippets | bool? | default true; `false` skips body previews for much faster pages |
 | source | "live"\|"index"? | default `"live"` (Mail.app Apple Events, 25 s budget). `"index"` queries the local corpus cache from mail_sync instead — instant, no budget; the response carries `data_as_of` so you can judge staleness |
 
@@ -91,6 +91,10 @@ not in the inbox). Scan window: newest 1000 messages (`SCAN_MAX` in
 
 Grouped responses replace `results` with `groups` and add
 `total_groups`; follow up with `mail_read(latest_id)`.
+
+Passing an EMAIL address as `account` returns
+`{"error":"unknown Mail account…","available_accounts":[…]}` instead of a
+raw AppleEvent error — self-correct in one turn.
 
 ### mail_read — auto
 
@@ -152,11 +156,77 @@ Newest first.
 `direction` is `in`/`out`; outgoing rows report `from: "me"`. Attachment-only
 messages have empty `text`.
 
+Tapback/reaction stubs are excluded by default. Stored text cannot corrupt
+the response envelope — control characters are sanitized server-side.
+
 ### messages_send — soft-gated
 
 Same flow as `mail_send`: `{to, body}` → confirmation token → execute.
 `to` is a participant handle (phone number or email). Action name:
 `messages.send`.
+
+Optional recipient allowlist: `state_dir/messages-send-allowlist.json`
+(JSON array of handles). When non-empty, recipients outside it are refused
+before the gate — see docs/safety.md.
+
+### messages_sync — auto
+
+Mirror chat.db history into `state_dir/index.db` for instant full-text
+search. Incremental by the monotone message ROWID (batched 2 000 rows per
+sqlite call, ~20 s budget, resumable — rerun until `truncated` disappears).
+Tapback stubs are excluded at the source.
+
+| Param | Type | Notes |
+|---|---|---|
+| full | bool? | rebuild from scratch (heals edited/deleted drift) |
+
+```json
+{"synced": 127467, "batches": 64, "total_indexed": 347467,
+ "data_as_of": "2026-08-25T16:58:55Z", "duration_ms": 8175}
+```
+
+### messages_search — auto
+
+FTS5 over the mirrored corpus. The query matches as a literal phrase
+(special characters cannot break it). Results carry bounded snippets —
+follow up with `messages_read(chat=…)`.
+
+| Param | Type | Notes |
+|---|---|---|
+| query | string | required, non-blank |
+| chat | string? | scope to one chat identifier/handle |
+| limit / offset | u32? | default 20 / 0, max 100 |
+
+```json
+{"total": 94, "results": [
+  {"chat": "+1425…", "from": "me", "direction": "out",
+   "date": "2026-06-06T20:11:00Z", "snippet": "just be at the [hackathon] …"}],
+ "data_as_of": "241067"}
+```
+
+`data_as_of` is the sync watermark — cite it as your coverage window.
+
+### messages_unread — auto
+
+Per-chat unread counts (`is_from_me=0 AND is_read=0`), heaviest first.
+Real-time from chat.db; the input for digests.
+
+```json
+{"total": 2, "chats": [
+  {"chat": "chat-9", "display_name": "Weekend Crew", "unread": 5,
+   "last_activity": "2026-08-24T01:00:00Z"}]}
+```
+
+### messages_attachments — auto
+
+Attachment METADATA only (name/mime/bytes/date), optionally scoped to one
+chat. Content stays on disk.
+
+```json
+{"total": 1, "attachments": [
+  {"name": "offer.pdf", "mime": "application/pdf",
+   "bytes": 182044, "date": "2026-08-01T12:00:00Z", "chat": "a@x"}]}
+```
 
 ## Calendar
 

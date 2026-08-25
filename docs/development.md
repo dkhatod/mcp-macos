@@ -44,6 +44,13 @@ MCP client ──stdio──► MacosServer (rmcp #[tool_router])
 
 ## JXA integration notes (hard-won)
 
+- `doShellScript` output uses **CR** line endings; split on `/\r\n|\r|\n/`.
+  Splitting on `\n` alone made every live messages_read return total:0.
+- Emit rows via sqlite `json_object()` and parse each line as JSON —
+  hand-rolled `'|||'` separators are ambiguous when fields are empty.
+- Sanitize stored text (`[\u0000-\u001F\u007F\u2028\u2029]`) before it
+  reaches any single-line JSON payload.
+
 All Apple scripting goes through `osascript -l JavaScript` and
 `personai_core::macos::run_jxa_json`, which wraps an expression in a
 `JSON.stringify({ok, value|error})` envelope. Rules the codebase already
