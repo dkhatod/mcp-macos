@@ -376,3 +376,14 @@ async fn attachments_surface_names_sizes_without_content() {
     assert_eq!(v["attachments"][0]["name"], "offer.pdf");
     assert_eq!(v["attachments"][0]["bytes"], 182044);
 }
+
+#[test]
+fn read_builder_excludes_tapback_stubs() {
+    // Tapbacks are metadata noise (associated_message_type != 0); reads
+    // should surface conversation content, not reaction stubs.
+    let script = mcp_macos::messages::read_expr_for_test(Some("a@x"), 10, 0);
+    assert!(
+        script.contains("COALESCE(m.associated_message_type,0)=0"),
+        "{script}"
+    );
+}

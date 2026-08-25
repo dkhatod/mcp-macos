@@ -246,6 +246,24 @@ impl MacosServer {
         ))
     }
 
+    /// Allowlist matcher: emails lowercase-exact; phones digits-only with a
+    /// ≥7-digit suffix rule (E164 vs local formats).
+    fn recipient_allowed(recipient: &str, allowlist: &[String]) -> bool {
+        fn norm(s: &str) -> String {
+            let t = s.trim().to_lowercase();
+            if t.starts_with('+') || t.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                t.chars().filter(|c| c.is_ascii_digit()).collect()
+            } else {
+                t
+            }
+        }
+        let target = norm(recipient);
+        allowlist.iter().any(|a| {
+            let n = norm(a);
+            n == target || (n.len() >= 7 && target.ends_with(&n))
+        })
+    }
+
     fn disabled(group: &str) -> String {
         serde_json::json!({
             "error": format!(
@@ -766,9 +784,28 @@ impl MacosServer {
         description = "Send an iMessage/SMS. Soft-gated: the first call returns status requires_confirmation with a confirmation_token and does NOT send; re-invoke with confirmation_token to execute. Tokens are single-use and expire in 5 minutes.",
         annotations(destructive_hint = true)
     )]
-    async fn messages_send(&self, Parameters(p): Parameters<MessagesSendParams>) -> String {
+    pub async fn messages_send(&self, Parameters(p): Parameters<MessagesSendParams>) -> String {
         if !self.enabled.messages {
             return Self::disabled("messages");
+        }
+        // OPTIONAL recipient allowlist: {state_dir}/messages-send-allowlist.json.
+        // Missing/empty = allow all (soft gate still applies). Emails match
+        // case-insensitively; phones compare digits-only with a suffix rule,
+        // so formatting differences cannot smuggle a different number.
+        let al_path = self.state_dir.join("messages-send-allowlist.json");
+        let allowlist: Vec<String> = std::fs::read_to_string(&al_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
+            .unwrap_or_default();
+        if !allowlist.is_empty() && !Self::recipient_allowed(&p.to, &allowlist) {
+            return serde_json::json!({
+                "error": format!(
+                    "recipient {:?} is not in the send allowlist                      (messages-send-allowlist.json)",
+                    p.to
+                ),
+                "available": allowlist,
+            })
+            .to_string();
         }
         let mut st = self.inner.messages.lock().await;
         json_result(

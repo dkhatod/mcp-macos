@@ -189,12 +189,12 @@ fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
              LEFT JOIN chat c ON c.ROWID=cmj.chat_id";
     let cmd = format!(
         "sqlite3 -separator '|||' {db} \"\
-         SELECT COUNT(*) {from_join} WHERE 1=1{chat_filter}; \
+         SELECT COUNT(*) {from_join} WHERE 1=1 AND COALESCE(m.associated_message_type,0)=0{chat_filter}; \
          SELECT COALESCE(CASE WHEN m.is_from_me=1 THEN 'me' ELSE h.id END,'unknown'),\
          CASE WHEN m.is_from_me=1 THEN 'out' ELSE 'in' END,\
          REPLACE(REPLACE(REPLACE(COALESCE(m.text,''),char(13),' '),char(10),' '),'|||','/'),\
          REPLACE(datetime(m.date/1000000000+978307200,'unixepoch'),' ','T')||'Z' \
-         {from_join} WHERE 1=1{chat_filter} ORDER BY m.date DESC \
+         {from_join} WHERE 1=1 AND COALESCE(m.associated_message_type,0)=0{chat_filter} ORDER BY m.date DESC \
          LIMIT {limit} OFFSET {offset};\""
     );
     format!(
@@ -443,4 +443,7 @@ pub fn unread_expr_for_test(limit: u32) -> String {
 }
 pub fn attachments_expr_for_test(chat: Option<&str>, limit: u32, offset: u32) -> String {
     attachments_expr(chat, limit, offset)
+}
+pub fn read_expr_for_test(chat: Option<&str>, limit: u32, offset: u32) -> String {
+    read_expr(chat, limit, offset)
 }
