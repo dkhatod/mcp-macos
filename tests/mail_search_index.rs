@@ -222,3 +222,56 @@ fn groups_respect_folder_scope() {
         "INBOX excluded from scope"
     );
 }
+
+#[test]
+fn empty_index_returns_zero_totals_not_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = IndexHandle::open(
+        dir.path().join("empty.db"),
+        mcp_macos::mail_index::MAIL_MIGRATIONS,
+    )
+    .unwrap();
+    std::mem::forget(dir);
+    let empty: Vec<String> = vec![];
+    let out = search_index(&h, &q(&empty, None, None, 20, 0)).unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["total"], 0);
+    assert_eq!(v["results"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        v["data_as_of"], "",
+        "never-synced index reports empty freshness"
+    );
+}
+
+#[test]
+fn until_window_is_exclusive_and_terms_case_insensitive() {
+    let h = seeded("window.db");
+    let terms = vec!["ASSESSMENT".to_string()];
+    let out = search_index(
+        &h,
+        &IndexQuery {
+            terms: &terms,
+            pairs: None,
+            since: None,
+            until: Some("2026-08-21T00:00:00.000Z"),
+            limit: 20,
+            offset: 0,
+            group: None,
+        },
+    )
+    .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    // Uppercase term matches lowercase-stored subject; until excludes 08-21+.
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["results"][0]["id"], "301");
+}
+
+#[test]
+fn offset_past_total_yields_empty_page_with_true_total() {
+    let h = seeded("overrun.db");
+    let empty: Vec<String> = vec![];
+    let out = search_index(&h, &q(&empty, None, None, 20, 500)).unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["total"], 6);
+    assert_eq!(v["results"].as_array().unwrap().len(), 0);
+}

@@ -118,3 +118,42 @@ fn cache_get_roundtrips_fields() {
     assert_eq!(v["date_iso"], json!("D"));
     assert_eq!(v["body_truncated"], true);
 }
+
+#[test]
+fn prune_on_empty_table_is_a_noop() {
+    let h = handle("prune-empty.db");
+    prune_bodies(&h, 100).unwrap(); // must not panic or error
+    let n: i64 = h
+        .query("SELECT COUNT(*) AS n FROM mail_bodies", &[])
+        .unwrap()
+        .remove(0)["n"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn recache_updates_fetched_at_for_lru_order() {
+    let h = handle("recache.db");
+    cache_put(&h, "a|1", "s", "f", "d", "old", false).unwrap();
+    h.query(
+        "UPDATE mail_bodies SET fetched_at = 1 WHERE cache_key = 'a|1'",
+        &[],
+    )
+    .unwrap();
+    // Re-read later → same key rewritten with a fresh timestamp so eviction
+    // order reflects actual access, not first-read.
+    cache_put(&h, "a|1", "s", "f", "d", "newer", false).unwrap();
+    let v = cache_get(&h, "a|1").unwrap().unwrap();
+    let ts = h
+        .query(
+            "SELECT fetched_at FROM mail_bodies WHERE cache_key = 'a|1'",
+            &[],
+        )
+        .unwrap()
+        .remove(0)["fetched_at"]
+        .as_i64()
+        .unwrap();
+    assert!(ts > 1, "fetched_at refreshed on rewrite");
+    assert_eq!(v["body"], json!("newer"));
+}

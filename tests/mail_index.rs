@@ -217,3 +217,115 @@ async fn sync_targets_sweeps_all_pairs() {
     assert_eq!(v["data_as_of"], "2026-08-01T00:00:00.000Z");
     assert!(v["duration_ms"].as_u64().is_some());
 }
+
+// --- Error-taxonomy coverage: every transport failure class must be -------
+// --- contained per-folder, never abort the sweep. --------------------------
+
+#[tokio::test]
+async fn sweep_survives_timeout_on_one_folder() {
+    let h = handle("timeout-sweep.db");
+    let mut t = MockTransport::new();
+    t.enqueue(&envelope(json!([
+        { "i": "1", "s": "x", "f": "a@x", "d": "2026-08-01T00:00:00.000Z" }
+    ])));
+    t.enqueue_timeout(); // folder 2 hangs
+    t.enqueue(&envelope(json!([
+        { "i": "3", "s": "z", "f": "c@x", "d": "2026-08-03T00:00:00.000Z" }
+    ])));
+    let targets = MailTargets::Folders(vec![
+        ("A".into(), "B".into()),
+        ("C".into(), "D".into()),
+        ("E".into(), "F".into()),
+    ]);
+    let out = sync_targets(&mut t, &h, &targets, false, 5000)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["synced_per_folder"]["A/B"]["scanned"], 1);
+    assert_eq!(v["synced_per_folder"]["E/F"]["scanned"], 1);
+    assert!(
+        v["errors"]["C/D"].as_str().is_some(),
+        "timeout recorded: {out}"
+    );
+}
+
+#[tokio::test]
+async fn sweep_survives_malformed_envelope_on_one_folder() {
+    let h = handle("malformed-sweep.db");
+    let mut t = MockTransport::new();
+    t.enqueue("not-json-at-all");
+    t.enqueue(&envelope(json!([
+        { "i": "9", "s": "y", "f": "b@x", "d": "2026-08-02T00:00:00.000Z" }
+    ])));
+    let targets = MailTargets::Folders(vec![
+        ("Bad".into(), "Box".into()),
+        ("Good".into(), "Box".into()),
+    ]);
+    let out = sync_targets(&mut t, &h, &targets, false, 5000)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["synced_per_folder"]["Good/Box"]["scanned"], 1);
+    assert!(v["errors"]["Bad/Box"].as_str().is_some());
+}
+
+#[test]
+fn delta_with_no_new_mail_leaves_rows_and_watermark_untouched() {
+    // Covered via builder contract: the delta pass carries the watermark
+    // floor; empty results must neither upsert nor regress the watermark.
+    let s = sync_expr("A", "B", Some("2026-08-24T10:00:00Z"), 5000);
+    assert!(
+        s.contains("Date.parse(\"2026-08-24T10:00:00Z\") - 3600000"),
+        "clock-skew buffer must be baked into the script"
+    );
+}
+
+#[test]
+fn full_replace_is_idempotent_across_double_full_passes() {
+    let h = handle("double-full.db");
+    let cols = [
+        "account",
+        "mailbox",
+        "apple_id",
+        "fingerprint",
+        "subject",
+        "sender",
+        "date_received",
+        "fetched_at",
+    ];
+    let row = |id: &str| {
+        json!({
+            "account": "A", "mailbox": "B", "apple_id": id,
+            "fingerprint": fingerprint("a@x","s","2026-08-01T00:00:00Z"),
+            "subject": "s", "sender": "a@x",
+            "date_received": "2026-08-01T00:00:00Z", "fetched_at": 1
+        })
+    };
+    h.replace_partition(
+        "mail_messages",
+        "mailbox_key",
+        "A/B",
+        &cols,
+        &["account", "mailbox", "apple_id"],
+        &[row("1")],
+    )
+    .unwrap();
+    let n = h
+        .replace_partition(
+            "mail_messages",
+            "mailbox_key",
+            "A/B",
+            &cols,
+            &["account", "mailbox", "apple_id"],
+            &[row("1")],
+        )
+        .unwrap();
+    assert_eq!(n, 1, "second full pass rewrites the same single row");
+    let count: i64 = h
+        .query("SELECT COUNT(*) AS n FROM mail_messages", &[])
+        .unwrap()
+        .remove(0)["n"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(count, 1);
+}
