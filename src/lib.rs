@@ -21,6 +21,10 @@ use tokio::sync::Mutex;
 
 pub mod calendar;
 pub mod index_schema;
+
+/// Internal re-export shim: surface modules share one JXA JSON runner.
+pub(crate) use personai_core::macos::run_jxa_json as run_jxa_json_pub;
+pub mod messages_index;
 pub mod clipboard;
 pub mod contacts;
 pub mod mail;
