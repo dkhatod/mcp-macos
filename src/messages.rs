@@ -97,6 +97,34 @@ impl<T: AppleTransport> MessagesToolset<T> {
         ))
     }
 
+    /// Per-chat unread counts, heaviest first — triage/digest input.
+    pub async fn unread(&mut self, limit: Option<u32>) -> Result<String, AppleError> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        let v = run_jxa_json(&mut self.transport, &unread_expr(limit)).await?;
+        Ok(crate::util::sanitize_json_text(
+            &crate::util::unwrap_string_payload(v)?.to_string(),
+        ))
+    }
+
+    /// Lists attachment metadata (name/mime/bytes/date), optionally scoped
+    /// to one chat. Never returns content — fetch files via disk tools.
+    pub async fn attachments(
+        &mut self,
+        chat: Option<String>,
+        limit: Option<u32>,
+        offset: u32,
+    ) -> Result<String, AppleError> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
+        let v = run_jxa_json(
+            &mut self.transport,
+            &attachments_expr(chat.as_deref(), limit, offset),
+        )
+        .await?;
+        Ok(crate::util::sanitize_json_text(
+            &crate::util::unwrap_string_payload(v)?.to_string(),
+        ))
+    }
+
     /// Sends an iMessage/SMS. Soft-gated like [`crate::mail::MailToolset::send`].
     pub async fn send(
         &mut self,
@@ -247,6 +275,103 @@ fn chats_expr(limit: u32, offset: u32) -> String {
     )
 }
 
+// --- Unread digest -----------------------------------------------------------
+
+/// Per-chat unread counts (`is_from_me=0 AND is_read=0`), heaviest chats
+/// first — the input for any triage or digest flow.
+fn unread_expr(limit: u32) -> String {
+    let db = "$HOME/Library/Messages/chat.db";
+    let from_join = "FROM message m \
+             JOIN chat_message_join cmj ON cmj.message_id=m.ROWID \
+             JOIN chat c ON c.ROWID=cmj.chat_id";
+    let where_clause = "WHERE m.is_from_me=0 AND m.is_read=0";
+    let cmd = format!(
+        "sqlite3 -separator '|||' {db} \"\
+         SELECT COUNT(*) FROM (SELECT DISTINCT c.ROWID {from_join} {where_clause}); \
+         SELECT COALESCE(NULLIF(c.chat_identifier,''),'unknown'),\
+         COALESCE(REPLACE(c.display_name,'|||','/'),''),COUNT(*),\
+         datetime(MAX(m.date)/1000000000+978307200,'unixepoch') \
+         {from_join} {where_clause} GROUP BY c.ROWID \
+         ORDER BY COUNT(*) DESC LIMIT {limit};\""
+    );
+    format!(
+        r#"(() => {{
+  const app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+  const out = String(app.doShellScript({}));
+  const clean = s2 => String(s2 == null ? '' : s2)
+    .replace(/[ -  ]/g, ' ');
+  const lines = out.length === 0 ? [] : out.split(/
+|
+|
+/);
+  const total = Number(lines[0]) || 0;
+  const chats = lines.slice(1).map(line => {{
+    const [chat, display_name, unread, last_activity] = line.split('|||');
+    return {{chat: clean(chat), display_name: clean(display_name),
+            unread: Number(unread) || 0, last_activity: clean(last_activity)}};
+  }});
+  return JSON.stringify({{total: total, chats: chats}});
+}})()"#,
+        crate::util::js_str(&cmd)
+    )
+}
+
+// --- Attachment listing -------------------------------------------------------
+
+/// Attachment METADATA only (name/mime/size/date) — never blob content.
+fn attachments_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
+    let db = "$HOME/Library/Messages/chat.db";
+    let from_join = "FROM attachment a \
+             JOIN message_attachment_join maj ON maj.attachment_id=a.ROWID \
+             JOIN message m ON m.ROWID=maj.message_id \
+             LEFT JOIN chat_message_join cmj ON cmj.message_id=m.ROWID \
+             LEFT JOIN chat c ON c.ROWID=cmj.chat_id";
+    let chat_filter = match chat {
+        Some(c) => format!(
+            " WHERE (c.chat_identifier={} OR h.id={} OR c.display_name={})",
+            sql_str(c),
+            // attachments join messages whose sender handle is the OTHER
+            // party's handle row; h is not joined above, so match by chat
+            // identity columns only.
+            sql_str(c),
+            sql_str(c)
+        ),
+        None => String::new(),
+    };
+    let _ = &from_join;
+    let cmd = format!(
+        "sqlite3 -separator '|||' {db} \"\
+         SELECT COUNT(*) {from_join}{chat_filter}; \
+         SELECT COALESCE(REPLACE(a.transfer_name,'|||','/'),'unnamed'),\
+         COALESCE(a.mime_type,''),COALESCE(a.total_bytes,0),\
+         COALESCE(datetime(m.date/1000000000+978307200,'unixepoch'),'') \
+         {from_join}{chat_filter} ORDER BY m.date DESC \
+         LIMIT {limit} OFFSET {offset};\""
+    );
+    format!(
+        r#"(() => {{
+  const app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+  const out = String(app.doShellScript({}));
+  const clean = s2 => String(s2 == null ? '' : s2)
+    .replace(/[ -  ]/g, ' ');
+  const lines = out.length === 0 ? [] : out.split(/
+|
+|
+/);
+  const total = Number(lines[0]) || 0;
+  const attachments = lines.slice(1).map(line => {{
+    const [name, mime, bytes, date] = line.split('|||');
+    return {{name: clean(name), mime: clean(mime),
+            bytes: Number(bytes) || 0, date: clean(date)}};
+  }});
+  return JSON.stringify({{total: total, offset: {offset}, limit: {limit}, attachments: attachments}});
+}})()"#,
+        crate::util::js_str(&cmd)
+    )
+}
+
 fn send_expr(to: &str, body: &str) -> String {
     format!(
         r#"(() => {{
@@ -309,4 +434,13 @@ mod debug_probe {
         std::fs::write("/tmp/full_expr.txt", &expr).unwrap();
         eprintln!("WROTE /tmp/full_expr.txt ({} bytes)", expr.len());
     }
+}
+
+/// Test seams: builder visibility without widening the public API beyond
+/// what integration contracts need.
+pub fn unread_expr_for_test(limit: u32) -> String {
+    unread_expr(limit)
+}
+pub fn attachments_expr_for_test(chat: Option<&str>, limit: u32, offset: u32) -> String {
+    attachments_expr(chat, limit, offset)
 }

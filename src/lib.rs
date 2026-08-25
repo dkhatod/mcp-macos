@@ -24,12 +24,12 @@ pub mod index_schema;
 
 /// Internal re-export shim: surface modules share one JXA JSON runner.
 pub(crate) use personai_core::macos::run_jxa_json as run_jxa_json_pub;
-pub mod messages_index;
 pub mod clipboard;
 pub mod contacts;
 pub mod mail;
 pub mod mail_index;
 pub mod messages;
+pub mod messages_index;
 pub mod notifications;
 pub mod permissions;
 pub mod policy;
@@ -324,11 +324,11 @@ impl MacosServer {
             }
         };
         let db = self.state_dir.join("index.db");
-        let handle = match personai_core::index::IndexHandle::open(&db, index_schema::INDEX_MIGRATIONS)
-        {
-            Ok(h) => h,
-            Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
-        };
+        let handle =
+            match personai_core::index::IndexHandle::open(&db, index_schema::INDEX_MIGRATIONS) {
+                Ok(h) => h,
+                Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+            };
         let mut st = self.inner.mail.lock().await;
         match st
             .sync_index(&handle, &targets, p.full.unwrap_or(false), scan)
@@ -365,11 +365,13 @@ impl MacosServer {
                 })
                 .to_string();
             }
-            let handle =
-                match personai_core::index::IndexHandle::open(&db, index_schema::INDEX_MIGRATIONS) {
-                    Ok(h) => h,
-                    Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
-                };
+            let handle = match personai_core::index::IndexHandle::open(
+                &db,
+                index_schema::INDEX_MIGRATIONS,
+            ) {
+                Ok(h) => h,
+                Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+            };
             // Same scope resolution as the live path below.
             let pairs: Option<Vec<(String, String)>> = if p
                 .folders

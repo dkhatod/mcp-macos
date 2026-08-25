@@ -313,3 +313,66 @@ async fn chats_surface_group_flag_and_participants() {
     assert_eq!(chats[0]["participant_count"], 4);
     assert_eq!(chats[1]["is_group"], false, "1:1 chat by participant count");
 }
+
+// --- Unread digest + attachment listing -------------------------------------
+
+#[test]
+fn unread_builder_filters_is_read_and_groups_by_chat() {
+    let script = mcp_macos::messages::unread_expr_for_test(20);
+    assert!(script.contains("m.is_from_me=0"), "{script}");
+    assert!(script.contains("m.is_read=0"), "{script}");
+    assert!(script.contains("GROUP BY c.ROWID"), "{script}");
+}
+
+#[tokio::test]
+async fn unread_surfaces_counts_newest_first() {
+    let payload = serde_json::json!({
+        "total": 2,
+        "chats": [
+            {"chat":"chat-9","display_name":"Weekend Crew","unread":5,"last_activity":"2026-08-24T01:00:00Z"},
+            {"chat":"+15551234567","display_name":"","unread":1,"last_activity":"2026-08-23T09:00:00Z"}
+        ]
+    });
+    let envelope = serde_json::json!({"ok": true, "value": payload.to_string()});
+    let canned = envelope.to_string();
+    let mut f = fixture(&[canned.as_str()]);
+    let out = f.ts.unread(Some(10)).await.unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["chats"][0]["unread"], 5);
+}
+
+#[test]
+fn attachments_builder_escapes_chat_and_lists_metadata_only() {
+    let script = mcp_macos::messages::attachments_expr_for_test(Some("O'Brien"), 20, 0);
+    assert!(
+        script.contains("O''Brien"),
+        "chat must be SQL-escaped: {script}"
+    );
+    assert!(script.contains("transfer_name"), "{script}");
+    assert!(
+        !script.contains("data IS NOT NULL"),
+        "never selects blob content"
+    );
+}
+
+#[tokio::test]
+async fn attachments_surface_names_sizes_without_content() {
+    let payload = serde_json::json!({
+        "total": 1, "offset": 0, "limit": 20,
+        "attachments": [
+            {"name":"offer.pdf","mime":"application/pdf","bytes":182044,"date":"2026-08-01T12:00:00Z","chat":"a@x"}
+        ]
+    });
+    let envelope = serde_json::json!({"ok": true, "value": payload.to_string()});
+    let canned = envelope.to_string();
+    let mut f = fixture(&[canned.as_str()]);
+    let out =
+        f.ts.attachments(Some("a@x".into()), Some(5), 0)
+            .await
+            .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["attachments"][0]["name"], "offer.pdf");
+    assert_eq!(v["attachments"][0]["bytes"], 182044);
+}
