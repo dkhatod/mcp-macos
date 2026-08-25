@@ -5,6 +5,30 @@ versions are semver (0.x: breaking changes bump minor).
 
 ## [Unreleased]
 
+### Added — Messages integration (index + triage surface)
+- **`messages_sync`**: mirrors chat.db history into the shared
+  `state_dir/index.db` via `personai-core::index`. Incremental by the
+  monotone `message.ROWID` watermark (batched 2k rows/call, budgeted,
+  resumable); tapback stubs excluded at the source; `full:true` rebuilds.
+- **`messages_search(query, chat?, limit?, offset?)`**: FTS5 full-text over
+  ALL synced history — bounded snippets (never full texts), newest first,
+  `data_as_of` freshness marker, FTS-special-character-safe phrase
+  matching.
+- **`messages_unread`**: per-chat unread counts, heaviest first — real-time
+  digest input.
+- **`messages_attachments(chat?, limit?, offset?)`**: attachment METADATA
+  only (name/mime/bytes/date).
+- Sync/search mappers emit `json_object()` rows from sqlite — no
+  separator-counting ambiguity with empty senders or pipe-bearing text
+  (found live: shifted `date_iso` values).
+- **Shared schema**: `index_schema::INDEX_MIGRATIONS` composes mail+messages
+  DDL; every `IndexHandle::open` on `index.db` now uses it (a v1-only
+  opener is rejected on v2 files instead of misreading them).
+
+### Changed
+- `messages_read` excludes tapback/reaction stubs by default
+  (`associated_message_type = 0`) so conversations read as content.
+
 ## [0.1.10] — 2026-08-24
 
 ### Fixed

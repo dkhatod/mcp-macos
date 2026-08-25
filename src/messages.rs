@@ -13,7 +13,7 @@ use personai_core::safety::{GateOutcome, SoftGate};
 use serde_json::json;
 use std::time::Duration;
 
-use crate::util::js_str;
+use crate::util::{js_str, sql_shell_lines_js};
 use crate::{DEFAULT_LIMIT, MAX_LIMIT};
 
 /// iMessage tool group over any transport.
@@ -95,6 +95,21 @@ impl<T: AppleTransport> MessagesToolset<T> {
         Ok(crate::util::sanitize_json_text(
             &crate::util::unwrap_string_payload(v)?.to_string(),
         ))
+    }
+
+    /// Mirror chat.db into `index.db` via the shared engine handle.
+    pub async fn sync_index(
+        &mut self,
+        h: &personai_core::index::IndexHandle,
+        full: bool,
+    ) -> Result<String, AppleError> {
+        crate::messages_index::sync_messages(
+            &mut self.transport,
+            h,
+            full,
+            crate::messages_index::BATCH_ROWS,
+        )
+        .await
     }
 
     /// Per-chat unread counts, heaviest first — triage/digest input.
@@ -189,96 +204,74 @@ fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
              LEFT JOIN chat c ON c.ROWID=cmj.chat_id";
     let cmd = format!(
         "sqlite3 -separator '|||' {db} \"\
-         SELECT COUNT(*) {from_join} WHERE 1=1 AND COALESCE(m.associated_message_type,0)=0{chat_filter}; \
-         SELECT COALESCE(CASE WHEN m.is_from_me=1 THEN 'me' ELSE h.id END,'unknown'),\
-         CASE WHEN m.is_from_me=1 THEN 'out' ELSE 'in' END,\
-         REPLACE(REPLACE(REPLACE(COALESCE(m.text,''),char(13),' '),char(10),' '),'|||','/'),\
-         REPLACE(datetime(m.date/1000000000+978307200,'unixepoch'),' ','T')||'Z' \
-         {from_join} WHERE 1=1 AND COALESCE(m.associated_message_type,0)=0{chat_filter} ORDER BY m.date DESC \
-         LIMIT {limit} OFFSET {offset};\""
+         SELECT COUNT(*) {from_join} \
+           WHERE 1=1 AND COALESCE(m.associated_message_type,0)=0{chat_filter}; \
+         SELECT json_object(\
+           'from', COALESCE(CASE WHEN m.is_from_me=1 THEN 'me' ELSE h.id END,'unknown'),\
+           'direction', CASE WHEN m.is_from_me=1 THEN 'out' ELSE 'in' END,\
+           'text', REPLACE(REPLACE(COALESCE(m.text,''),char(13),' '),char(10),' '),\
+           'date', REPLACE(datetime(m.date/1000000000+978307200,'unixepoch'),' ','T')||'Z') \
+         {from_join} WHERE 1=1 AND COALESCE(m.associated_message_type,0)=0{chat_filter} \
+         ORDER BY m.date DESC LIMIT {limit} OFFSET {offset};\""
     );
-    format!(
-        r#"(() => {{
-  const app = Application.currentApplication();
-  app.includeStandardAdditions = true;
-  const out = String(app.doShellScript({}));
-  // Stored text can carry characters SQL's CR/LF stripping misses
-  // (vertical tab, U+2028...); they would corrupt the single-line payload.
-  const clean = s2 => String(s2 == null ? '' : s2)
-    .replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, ' ');
-  // doShellScript emits CR-delimited text — accept CR, CRLF and LF.
-  const lines = out.length === 0 ? [] : out.split(/\r\n|\r|\n/);
-  const total = Number(lines[0]) || 0;
-  const messages = lines.slice(1).map(line => {{
-    const [from, direction, text, date] = line.split('|||');
-    return {{from: clean(from), direction: clean(direction),
-            text: clean(text), date: clean(date)}};
-  }});
-  const payload = {{total: total, messages: messages}};
-  if (messages.length < {}) payload.more = true;
-  return JSON.stringify(payload);
-}})()"#,
-        js_str(&cmd),
-        limit,
-    )
+    sql_shell_lines_js(&cmd)
+        + &(r#"  const total = Number(lines[0]) || 0;
+  const messages = [];
+  for (const line of lines.slice(1)) {
+    if (!line) continue;
+    const o = JSON.parse(line);
+    messages.push({from: o.from, direction: o.direction,
+                   text: o.text == null ? '' : String(o.text), date: o.date});
+  }
+  const payload = {total: total, messages: messages};
+  if (messages.length < "#
+            .to_string()
+            + &limit.to_string()
+            + ") payload.more = true;\n  return JSON.stringify(payload);\n})()\n")
 }
 
-/// Chat discovery: identifier, display name, service, a sample participant
-/// handle, message count, and last activity — recency-ordered, paginated.
-/// This is how agents resolve "send to NAME" without guessing handles.
 fn chats_expr(limit: u32, offset: u32) -> String {
     let db = "$HOME/Library/Messages/chat.db";
     let cmd = format!(
         "sqlite3 -separator '|||' {db} \"\
          SELECT COUNT(*) FROM chat; \
-         SELECT COALESCE(NULLIF(c.chat_identifier,''),'unknown'),\
-         COALESCE(REPLACE(c.display_name,'|||','/'),''),COALESCE(c.service_name,''),\
-         COALESCE((SELECT h.id FROM handle h JOIN chat_handle_join chj \
-           ON chj.handle_id=h.ROWID WHERE chj.chat_id=c.ROWID LIMIT 1),''),\
-         (SELECT COUNT(*) FROM chat_message_join cmj2 WHERE cmj2.chat_id=c.ROWID),\
-         datetime(COALESCE(MAX(cmj3.message_date),0)/1000000000+978307200,'unixepoch'),\
-         (SELECT COUNT(DISTINCT chj2.handle_id) FROM chat_handle_join chj2 \
-           WHERE chj2.chat_id=c.ROWID),\
-         COALESCE((SELECT GROUP_CONCAT(DISTINCT h3.id) FROM chat_handle_join chj3 \
-           JOIN handle h3 ON h3.ROWID=chj3.handle_id WHERE chj3.chat_id=c.ROWID),'') \
+         SELECT json_object(\
+           'identifier', COALESCE(NULLIF(c.chat_identifier,''),'unknown'),\
+           'display_name', COALESCE(c.display_name,''),\
+           'service', COALESCE(c.service_name,''),\
+           'handle', COALESCE((SELECT h.id FROM handle h JOIN chat_handle_join chj \
+             ON chj.handle_id=h.ROWID WHERE chj.chat_id=c.ROWID LIMIT 1),''),\
+           'message_count', (SELECT COUNT(*) FROM chat_message_join cmj2 \
+             WHERE cmj2.chat_id=c.ROWID),\
+           'last_activity', datetime(COALESCE(MAX(cmj3.message_date),0)/1000000000+978307200,'unixepoch'),\
+           'participant_count', (SELECT COUNT(DISTINCT chj2.handle_id) FROM chat_handle_join chj2 \
+             WHERE chj2.chat_id=c.ROWID),\
+           'participants', COALESCE((SELECT GROUP_CONCAT(DISTINCT h3.id) FROM chat_handle_join chj3 \
+             JOIN handle h3 ON h3.ROWID=chj3.handle_id WHERE chj3.chat_id=c.ROWID),'')) \
          FROM chat c \
          LEFT JOIN chat_message_join cmj3 ON cmj3.chat_id=c.ROWID \
          GROUP BY c.ROWID ORDER BY MAX(cmj3.message_date) DESC \
          LIMIT {limit} OFFSET {offset};\""
     );
-    format!(
-        r#"(() => {{
-  const app = Application.currentApplication();
-  app.includeStandardAdditions = true;
-  const out = String(app.doShellScript({}));
-  // doShellScript emits CR-delimited text — accept CR, CRLF and LF.
-  const lines = out.length === 0 ? [] : out.split(/\r\n|\r|\n/);
-  const total = Number(lines[0]) || 0;
-    // Stored display names carry the same control-char hazard as text.
-    const clean = s2 => String(s2 == null ? '' : s2)
-      .replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, ' ');
-    const chats = lines.slice(1).map(line => {{
-      const [identifier, display_name, service, handle, message_count,
-             last_activity, participant_count, participants] = line.split('|||');
-      const pc = Number(participant_count) || 0;
-      return {{identifier: clean(identifier), display_name: clean(display_name),
-              service: clean(service), handle: clean(handle),
-              message_count: Number(message_count) || 0,
-              last_activity: clean(last_activity),
-              is_group: pc > 1,
-              participants: participants ? clean(participants).split(',').slice(0, 8) : [],
-              participant_count: pc}};
-    }});
-    return JSON.stringify({{total: total, chats: chats}});
-}})()"#,
-        js_str(&cmd),
-    )
+    sql_shell_lines_js(&cmd)
+        + r#"  const total = Number(lines[0]) || 0;
+  const chats = [];
+  for (const line of lines.slice(1)) {
+    if (!line) continue;
+    const o = JSON.parse(line);
+    const pc = Number(o.participant_count) || 0;
+    chats.push({identifier: o.identifier, display_name: o.display_name,
+                service: o.service, handle: o.handle,
+                message_count: Number(o.message_count) || 0,
+                last_activity: o.last_activity,
+                is_group: pc > 1,
+                participants: o.participants ? String(o.participants).split(',').slice(0, 8) : [],
+                participant_count: pc});
+  }
+  return JSON.stringify({total: total, chats: chats});
+})()"#
 }
 
-// --- Unread digest -----------------------------------------------------------
-
-/// Per-chat unread counts (`is_from_me=0 AND is_read=0`), heaviest chats
-/// first — the input for any triage or digest flow.
 fn unread_expr(limit: u32) -> String {
     let db = "$HOME/Library/Messages/chat.db";
     let from_join = "FROM message m \
@@ -288,38 +281,27 @@ fn unread_expr(limit: u32) -> String {
     let cmd = format!(
         "sqlite3 -separator '|||' {db} \"\
          SELECT COUNT(*) FROM (SELECT DISTINCT c.ROWID {from_join} {where_clause}); \
-         SELECT COALESCE(NULLIF(c.chat_identifier,''),'unknown'),\
-         COALESCE(REPLACE(c.display_name,'|||','/'),''),COUNT(*),\
-         datetime(MAX(m.date)/1000000000+978307200,'unixepoch') \
+         SELECT json_object(\
+           'chat', COALESCE(NULLIF(c.chat_identifier,''),'unknown'),\
+           'display_name', COALESCE(c.display_name,''),\
+           'unread', COUNT(*),\
+           'last_activity', datetime(MAX(m.date)/1000000000+978307200,'unixepoch')) \
          {from_join} {where_clause} GROUP BY c.ROWID \
          ORDER BY COUNT(*) DESC LIMIT {limit};\""
     );
-    format!(
-        r#"(() => {{
-  const app = Application.currentApplication();
-  app.includeStandardAdditions = true;
-  const out = String(app.doShellScript({}));
-  const clean = s2 => String(s2 == null ? '' : s2)
-    .replace(/[ -  ]/g, ' ');
-  const lines = out.length === 0 ? [] : out.split(/
-|
-|
-/);
-  const total = Number(lines[0]) || 0;
-  const chats = lines.slice(1).map(line => {{
-    const [chat, display_name, unread, last_activity] = line.split('|||');
-    return {{chat: clean(chat), display_name: clean(display_name),
-            unread: Number(unread) || 0, last_activity: clean(last_activity)}};
-  }});
-  return JSON.stringify({{total: total, chats: chats}});
-}})()"#,
-        crate::util::js_str(&cmd)
-    )
+    sql_shell_lines_js(&cmd)
+        + r#"  const total = Number(lines[0]) || 0;
+  const chats = [];
+  for (const line of lines.slice(1)) {
+    if (!line) continue;
+    const o = JSON.parse(line);
+    chats.push({chat: o.chat, display_name: o.display_name,
+                unread: Number(o.unread) || 0, last_activity: o.last_activity});
+  }
+  return JSON.stringify({total: total, chats: chats});
+})()"#
 }
 
-// --- Attachment listing -------------------------------------------------------
-
-/// Attachment METADATA only (name/mime/size/date) — never blob content.
 fn attachments_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
     let db = "$HOME/Library/Messages/chat.db";
     let from_join = "FROM attachment a \
@@ -329,111 +311,59 @@ fn attachments_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
              LEFT JOIN chat c ON c.ROWID=cmj.chat_id";
     let chat_filter = match chat {
         Some(c) => format!(
-            " WHERE (c.chat_identifier={} OR h.id={} OR c.display_name={})",
-            sql_str(c),
-            // attachments join messages whose sender handle is the OTHER
-            // party's handle row; h is not joined above, so match by chat
-            // identity columns only.
+            " WHERE (c.chat_identifier={} OR c.display_name={})",
             sql_str(c),
             sql_str(c)
         ),
         None => String::new(),
     };
-    let _ = &from_join;
     let cmd = format!(
         "sqlite3 -separator '|||' {db} \"\
          SELECT COUNT(*) {from_join}{chat_filter}; \
-         SELECT COALESCE(REPLACE(a.transfer_name,'|||','/'),'unnamed'),\
-         COALESCE(a.mime_type,''),COALESCE(a.total_bytes,0),\
-         COALESCE(datetime(m.date/1000000000+978307200,'unixepoch'),'') \
+         SELECT json_object(\
+           'name', COALESCE(a.transfer_name,'unnamed'),\
+           'mime', COALESCE(a.mime_type,''),\
+           'bytes', COALESCE(a.total_bytes,0),\
+           'date', COALESCE(datetime(m.date/1000000000+978307200,'unixepoch'),''),\
+           'chat', COALESCE(c.chat_identifier,'')) \
          {from_join}{chat_filter} ORDER BY m.date DESC \
          LIMIT {limit} OFFSET {offset};\""
     );
-    format!(
-        r#"(() => {{
-  const app = Application.currentApplication();
-  app.includeStandardAdditions = true;
-  const out = String(app.doShellScript({}));
-  const clean = s2 => String(s2 == null ? '' : s2)
-    .replace(/[ -  ]/g, ' ');
-  const lines = out.length === 0 ? [] : out.split(/
-|
-|
-/);
-  const total = Number(lines[0]) || 0;
-  const attachments = lines.slice(1).map(line => {{
-    const [name, mime, bytes, date] = line.split('|||');
-    return {{name: clean(name), mime: clean(mime),
-            bytes: Number(bytes) || 0, date: clean(date)}};
-  }});
-  return JSON.stringify({{total: total, offset: {offset}, limit: {limit}, attachments: attachments}});
-}})()"#,
-        crate::util::js_str(&cmd)
-    )
+    sql_shell_lines_js(&cmd)
+        + &(r#"  const total = Number(lines[0]) || 0;
+  const attachments = [];
+  for (const line of lines.slice(1)) {
+    if (!line) continue;
+    const o = JSON.parse(line);
+    attachments.push({name: o.name, mime: o.mime,
+                      bytes: Number(o.bytes) || 0, date: o.date, chat: o.chat});
+  }
+  return JSON.stringify({total: total, offset: "#
+            .to_string()
+            + &offset.to_string()
+            + ", limit: "
+            + &limit.to_string()
+            + ", attachments: attachments});\n})()\n")
 }
 
 fn send_expr(to: &str, body: &str) -> String {
     format!(
         r#"(() => {{
   const M = Application('Messages');
-  const svc = M.services().find(s => s.enabled());
-  if (!svc) throw new Error('no enabled Messages service');
-  const hits = svc.participants.whose({{handle: {}}})();
-  if (hits.length === 0) throw new Error('participant not found: {}');
-  M.send({}, {{to: hits[0]}});
-  return {{status: 'sent'}};
+  for (const svc of M.services()) {{
+    if (!svc.enabled()) continue;
+    const hits = svc.participants.whose({{handle: {}}})();
+    if (hits.length > 0) {{
+      M.send({}, {{to: hits[0]}});
+      return {{status: 'sent', service: svc.name()}};
+    }}
+  }}
+  throw new Error('participant not found on any enabled service: {}');
 }})()"#,
         js_str(to),
-        js_str(to),
         js_str(body),
+        js_str(to),
     )
-}
-
-#[cfg(test)]
-mod builder_tests {
-    use super::*;
-
-    #[test]
-    fn chats_builder_counts_participants_for_group_detection() {
-        let script = chats_expr(20, 0);
-        assert!(
-            script.contains("COUNT(DISTINCT chj2.handle_id)"),
-            "{script}"
-        );
-        assert!(script.contains("GROUP_CONCAT(DISTINCT h3.id)"), "{script}");
-    }
-
-    #[test]
-    fn read_builder_strips_separator_collisions_from_text() {
-        let script = read_expr(Some("a@x"), 10, 0);
-        assert!(script.contains("'|||','/'"), "{script}");
-    }
-
-    #[test]
-    fn mappers_split_on_every_line_ending_style() {
-        // doShellScript returns CR-delimited output (classic JXA quirk):
-        // splitting on '\n' alone collapsed the whole blob into one line,
-        // yielding silent total:0 against EVERY live mailbox.
-        for script in [read_expr(Some("a@x"), 10, 0), chats_expr(20, 0)] {
-            assert!(
-                script.contains("split(/\\r\\n|\\r|\\n/)"),
-                "mapper must handle CR/CRLF/LF: {script}"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
-mod debug_probe {
-    use super::*;
-
-    #[test]
-    #[ignore]
-    fn print_read_expr() {
-        let expr = read_expr(Some("+17038140603"), 2, 0);
-        std::fs::write("/tmp/full_expr.txt", &expr).unwrap();
-        eprintln!("WROTE /tmp/full_expr.txt ({} bytes)", expr.len());
-    }
 }
 
 /// Test seams: builder visibility without widening the public API beyond

@@ -57,12 +57,17 @@ fn envelope(rows: Value) -> String {
 }
 
 #[test]
-fn sync_builder_filters_tapbacks_and_pages_by_rowid() {
+fn sync_builder_filters_tapbacks_pages_by_rowid_and_emits_json_rows() {
     let s = sync_expr(41, 2000);
     assert!(s.contains("m.ROWID > 41"), "{s}");
     assert!(s.contains("associated_message_type,0)=0"), "{s}");
     assert!(s.contains("LIMIT 2000"), "{s}");
-    // doShellScript emits CR endings — the mapper must be robust.
+    assert!(s.contains("json_object("), "rows must be structured: {s}");
+    assert!(
+        !s.contains("'|||'"),
+        "separator counting is ambiguous with empty fields: {s}"
+    );
+    assert!(s.contains("JSON.parse"), "rows parse individually: {s}");
     assert!(s.contains("split(/\\r\\n|\\r|\\n/)"), "{s}");
 }
 

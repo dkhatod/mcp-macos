@@ -21,9 +21,7 @@ fn server_with_allowlist(content: Option<&str>) -> MacosServer {
 }
 
 fn params(to: &str) -> Parameters<MessagesSendParams> {
-    Parameters(
-        serde_json::from_value(serde_json::json!({ "to": to, "body": "hi" })).unwrap(),
-    )
+    Parameters(serde_json::from_value(serde_json::json!({ "to": to, "body": "hi" })).unwrap())
 }
 
 #[tokio::test]

@@ -769,6 +769,95 @@ impl MacosServer {
     }
 
     #[tool(
+        description = "Mirror chat.db history into the local search index (state_dir/index.db). Incremental by ROWID watermark — typically seconds. Run once per session BEFORE messages_search. full:true rebuilds from scratch (heals edited/deleted drift).",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn messages_sync(&self, Parameters(p): Parameters<MessagesSyncParams>) -> String {
+        if !self.enabled.messages {
+            return Self::disabled("messages");
+        }
+        let handle = match personai_core::index::IndexHandle::open(
+            self.state_dir.join("index.db"),
+            index_schema::INDEX_MIGRATIONS,
+        ) {
+            Ok(h) => h,
+            Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+        };
+        let mut st = self.inner.messages.lock().await;
+        match st.sync_index(&handle, p.full.unwrap_or(false)).await {
+            Ok(s) => s,
+            Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+        }
+    }
+
+    #[tool(
+        description = "Full-text search over ALL synced iMessage/SMS history. Bounded snippets (never full texts), newest first, data_as_of freshness marker — pair with messages_read(chat=…) for surrounding context. Requires a prior messages_sync this session.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn messages_search(&self, Parameters(p): Parameters<MessagesSearchParams>) -> String {
+        if !self.enabled.messages {
+            return Self::disabled("messages");
+        }
+        let query = p.query.trim();
+        if query.is_empty() {
+            return serde_json::json!({"error": "query must not be blank"}).to_string();
+        }
+        let db = self.state_dir.join("index.db");
+        if !db.exists() {
+            return serde_json::json!({
+                "error": "no local index yet — run messages_sync first",
+                "hint": { "full": true }
+            })
+            .to_string();
+        }
+        let handle =
+            match personai_core::index::IndexHandle::open(&db, index_schema::INDEX_MIGRATIONS) {
+                Ok(h) => h,
+                Err(e) => return serde_json::json!({ "error": e.to_string() }).to_string(),
+            };
+        let q = messages_index::MsgQuery {
+            query,
+            chat: p.chat.as_deref().filter(|c| !c.is_empty()),
+            limit: p.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT),
+            offset: p.offset.unwrap_or(0),
+        };
+        match messages_index::search_messages(&handle, &q).await {
+            Ok(s) => s,
+            Err(e) => serde_json::json!({ "error": e.to_string() }).to_string(),
+        }
+    }
+
+    #[tool(
+        description = "Per-chat UNREAD counts, heaviest chats first — real-time from chat.db; the input for digests and triage.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn messages_unread(&self, Parameters(p): Parameters<MessagesUnreadParams>) -> String {
+        if !self.enabled.messages {
+            return Self::disabled("messages");
+        }
+        let mut st = self.inner.messages.lock().await;
+        json_result(st.unread(p.limit).await)
+    }
+
+    #[tool(
+        description = "List MESSAGE ATTACHMENT metadata (name/mime/bytes/date), optionally scoped to one chat. Never returns file content.",
+        annotations(read_only_hint = true)
+    )]
+    pub async fn messages_attachments(
+        &self,
+        Parameters(p): Parameters<MessagesAttachmentsParams>,
+    ) -> String {
+        if !self.enabled.messages {
+            return Self::disabled("messages");
+        }
+        let mut st = self.inner.messages.lock().await;
+        json_result(
+            st.attachments(p.chat.clone(), p.limit, p.offset.unwrap_or(0))
+                .await,
+        )
+    }
+
+    #[tool(
         description = "List iMessage/SMS chats: identifier, display name, service, a sample participant handle, message count, and last activity — most recent first. THE way to resolve 'send to NAME' into a concrete handle before messages_send.",
         annotations(read_only_hint = true)
     )]
@@ -1092,7 +1181,7 @@ coverage window."#;
     // NOTE: attribute macros require a literal here. tests/version_parity.rs
     // fails the build if this drifts from Cargo.toml.
     version = "0.1.10",
-    instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> FIRST mail_sync(folders:[\"*\"]) to refresh the local index, THEN mail_search(source:\"index\", folders:[\"*\"], group_by:\"sender\") as the census; a sender group is NOT one application — when distinct_subjects exceeds sample_subjects.length for a sender (big ATS senders like amazon.jobs span many postings), drill down with mail_search(source:\"index\", query:\"<sender-key>\", folders:[same], group_by:\"subject\") before reporting, then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update/calendar_delete; recipient names (people) -> contacts_search first, chat handles -> messages_chats first; task items -> reminders_read/reminders_create/reminders_complete; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
+    instructions = "macOS automation suite: Mail, Messages (iMessage/SMS), Calendar, Notifications, Clipboard. ROUTING — for anything touching those apps ALWAYS use these tools instead of osascript/AppleScript/JXA via shell; raw scripting is slow on real mailboxes, returns unbounded output, and bypasses scoping plus safety gates. Triggers: check/find/read/summarize/triage email or job-application status -> FIRST mail_sync(folders:[\"*\"]) to refresh the local index, THEN mail_search(source:\"index\", folders:[\"*\"], group_by:\"sender\") as the census; a sender group is NOT one application — when distinct_subjects exceeds sample_subjects.length for a sender (big ATS senders like amazon.jobs span many postings), drill down with mail_search(source:\"index\", query:\"<sender-key>\", folders:[same], group_by:\"subject\") before reporting, then mail_read; send/forward/reply email -> mail_send/mail_forward/mail_reply; iMessage/SMS history -> messages_read, sends -> messages_send; calendar events -> calendar_list/calendar_read/calendar_create/calendar_update/calendar_delete; recipient names (people) -> contacts_search first, chat handles -> messages_chats first; message history/full-text search -> messages_sync once then messages_search (bounded snippets); unread digest -> messages_unread; attachment discovery -> messages_attachments; task items -> reminders_read/reminders_create/reminders_complete; clipboard text -> clipboard_get/clipboard_set; any permission error -> permissions_check. Typical flow: mail_list_accounts -> mail_list_mailboxes -> mail_search(query, since=..., folders=[...]) -> mail_read(id) only where a snippet is not enough. Results are summary-first metadata + snippet, never bodies; pages default 20 / max 100 - iterate offset instead of dumping output. Sends and calendar writes are soft-gated: first call returns requires_confirmation + single-use confirmation_token (5-min TTL); re-invoke with the token to execute; reads, notifications, clipboard are ungated. Error payloads carry actionable fix hints - follow them. For status/history tasks consult the personai state directory before querying apps and record findings there after."
 )]
 impl rmcp::ServerHandler for MacosServer {
     async fn list_tools(
@@ -1407,6 +1496,49 @@ pub struct MessagesSendParams {
     /// Token from a previous requires_confirmation response.
     #[serde(default)]
     pub confirmation_token: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MessagesSyncParams {
+    /// Ignore the ROWID watermark and rebuild the mirror from scratch
+    /// (heals edits/deletes drift). Default false.
+    #[serde(default)]
+    pub full: Option<bool>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MessagesSearchParams {
+    /// Literal text to find (wrapped as an FTS phrase internally).
+    pub query: String,
+    /// Optional chat identifier/handle to scope results.
+    #[serde(default)]
+    pub chat: Option<String>,
+    /// Page size (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Page offset (default 0).
+    #[serde(default)]
+    pub offset: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MessagesUnreadParams {
+    /// Max chats to return (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct MessagesAttachmentsParams {
+    /// Optional chat identifier/handle scope.
+    #[serde(default)]
+    pub chat: Option<String>,
+    /// Page size (default 20, max 100).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Page offset (default 0).
+    #[serde(default)]
+    pub offset: Option<u32>,
 }
 
 #[derive(Deserialize, JsonSchema)]

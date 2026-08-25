@@ -61,6 +61,21 @@ pub(crate) fn sanitize_json_text(s: &str) -> String {
         .collect()
 }
 
+/// Shared shell-SQL prologue: runs `cmd` inside JXA's doShellScript and
+/// yields CR/CRLF/LF-safe `lines`. Builders append their own mapping.
+pub(crate) fn sql_shell_lines_js(cmd: &str) -> String {
+    format!(
+        r#"(() => {{
+  const app = Application.currentApplication();
+  app.includeStandardAdditions = true;
+  const out = String(app.doShellScript({}));
+  // doShellScript emits CR-delimited text — accept CR, CRLF and LF.
+  const lines = out.length === 0 ? [] : out.split(/\r\n|\r|\n/);
+"#,
+        js_str(cmd)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::js_str;
