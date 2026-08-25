@@ -115,3 +115,83 @@ async fn delta_sync_starts_after_stored_watermark() {
     let script = &t.calls()[0].script;
     assert!(script.contains("m.ROWID > 10"), "{script}");
 }
+
+// --- Cycle C: FTS search over the mirrored corpus --------------------------
+
+use mcp_macos::messages_index::{search_messages, MsgQuery};
+
+fn seed_search(h: &IndexHandle) {
+    let cols = ["rowid_src","chat_identifier","is_from_me","sender","text","date_iso","fetched_at"];
+    let row = |rid: i64, chat: &str, me: i64, sender: &str, text: &str, date: &str| {
+        json!({"rowid_src": rid, "chat_identifier": chat, "is_from_me": me,
+               "sender": sender, "text": text, "date_iso": date, "fetched_at": 1})
+    };
+    h.upsert("msg_messages", &cols, &["rowid_src"], &[
+        row(1, "+17038140603", 0, "+17038140603", "hackathon team forming, join us", "2026-07-05T10:00:00Z"),
+        row(2, "chat-weekend", 1, "", "i will lead the hackathon demo", "2026-07-06T10:00:00Z"),
+        row(3, "+17038140603", 0, "+17038140603", "lunch tomorrow?", "2026-07-07T10:00:00Z"),
+        row(4, "chat-weekend", 0, "b@x", r#"quotes "here" and dashes -fine"#, "2026-07-08T10:00:00Z"),
+    ]).unwrap();
+    h.set_watermark("messages", "chatdb", "4", &json!({})).unwrap();
+}
+
+#[tokio::test]
+async fn search_matches_terms_with_bounded_snippets() {
+    let h = handle("search.db");
+    seed_search(&h);
+    let out = search_messages(&h, &MsgQuery {
+        query: "hackathon", chat: None, limit: 20, offset: 0,
+    }).await.unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["total"], 2);
+    assert_eq!(v["data_as_of"], "4", "freshness = watermark");
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results[0]["chat"], "chat-weekend", "newest first");
+    assert!(results[0]["snippet"].as_str().unwrap().contains("hackathon"));
+    // Token diet: snippet is an excerpt, not the full text.
+    assert!(results[0]["snippet"].as_str().unwrap().len() <= 80);
+}
+
+#[tokio::test]
+async fn search_narrows_by_chat_and_paginates() {
+    let h = handle("narrow.db");
+    seed_search(&h);
+    let out = search_messages(&h, &MsgQuery {
+        query: "hackathon",
+        chat: Some("+17038140603"),
+        limit: 20, offset: 0,
+    }).await.unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["total"], 1);
+    let page2 = search_messages(&h, &MsgQuery {
+        query: "hackathon", chat: None, limit: 1, offset: 1,
+    }).await.unwrap();
+    let v2: Value = serde_json::from_str(&page2).unwrap();
+    assert_eq!(v2["results"].as_array().unwrap().len(), 1);
+    assert_eq!(v2["results"][0]["chat"], "+17038140603");
+}
+
+#[tokio::test]
+async fn search_never_chokes_on_fts_special_characters() {
+    let h = handle("special.db");
+    seed_search(&h);
+    for hostile in ["what's up -news", r#""quoted""#, "a OR b", "NEAR/5 *"] {
+        let out = search_messages(&h, &MsgQuery {
+            query: hostile, chat: None, limit: 5, offset: 0,
+        }).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v["total"].is_u64(), "{hostile} errored: {out}");
+    }
+}
+
+#[tokio::test]
+async fn direction_and_from_derived_correctly() {
+    let h = handle("dir.db");
+    seed_search(&h);
+    let out = search_messages(&h, &MsgQuery {
+        query: "lead", chat: None, limit: 5, offset: 0,
+    }).await.unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["results"][0]["direction"], "out");
+    assert_eq!(v["results"][0]["from"], "me");
+}
