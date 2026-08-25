@@ -53,7 +53,9 @@ impl<T: AppleTransport> MessagesToolset<T> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let expr = read_expr(chat.as_deref(), limit, offset);
         match run_jxa_json(&mut self.transport, &expr).await {
-            Ok(v) => Ok(crate::util::unwrap_string_payload(v)?.to_string()),
+            Ok(v) => Ok(crate::util::sanitize_json_text(
+                &crate::util::unwrap_string_payload(v)?.to_string(),
+            )),
             Err(e @ AppleError::Parse(_)) => {
                 // Live-quirk diagnostic: dump the raw osascript stdout so
                 // the user can see what broke the single-line envelope.
@@ -90,7 +92,9 @@ impl<T: AppleTransport> MessagesToolset<T> {
     pub async fn chats(&mut self, limit: Option<u32>, offset: u32) -> Result<String, AppleError> {
         let limit = limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
         let v = run_jxa_json(&mut self.transport, &chats_expr(limit, offset)).await?;
-        Ok(crate::util::unwrap_string_payload(v)?.to_string())
+        Ok(crate::util::sanitize_json_text(
+            &crate::util::unwrap_string_payload(v)?.to_string(),
+        ))
     }
 
     /// Sends an iMessage/SMS. Soft-gated like [`crate::mail::MailToolset::send`].
@@ -160,7 +164,7 @@ fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
          SELECT COUNT(*) {from_join} WHERE 1=1{chat_filter}; \
          SELECT COALESCE(CASE WHEN m.is_from_me=1 THEN 'me' ELSE h.id END,'unknown'),\
          CASE WHEN m.is_from_me=1 THEN 'out' ELSE 'in' END,\
-         REPLACE(REPLACE(COALESCE(m.text,''),char(13),' '),char(10),' '),\
+         REPLACE(REPLACE(REPLACE(COALESCE(m.text,''),char(13),' '),char(10),' '),'|||','/'),\
          REPLACE(datetime(m.date/1000000000+978307200,'unixepoch'),' ','T')||'Z' \
          {from_join} WHERE 1=1{chat_filter} ORDER BY m.date DESC \
          LIMIT {limit} OFFSET {offset};\""
@@ -170,16 +174,21 @@ fn read_expr(chat: Option<&str>, limit: u32, offset: u32) -> String {
   const app = Application.currentApplication();
   app.includeStandardAdditions = true;
   const out = String(app.doShellScript({}));
-  const lines = out.length === 0 ? [] : out.split('\n');
+  // Stored text can carry characters SQL's CR/LF stripping misses
+  // (vertical tab, U+2028...); they would corrupt the single-line payload.
+  const clean = s2 => String(s2 == null ? '' : s2)
+    .replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, ' ');
+  // doShellScript emits CR-delimited text — accept CR, CRLF and LF.
+  const lines = out.length === 0 ? [] : out.split(/\r\n|\r|\n/);
   const total = Number(lines[0]) || 0;
   const messages = lines.slice(1).map(line => {{
     const [from, direction, text, date] = line.split('|||');
-    return {{from: from, direction: direction, text: text || '', date: date}};
+    return {{from: clean(from), direction: clean(direction),
+            text: clean(text), date: clean(date)}};
   }});
-  const rowJson = messages.map(m => JSON.stringify(m)).join(',\n');
-  let payload = '{{"total":' + total + ',"messages":[\n' + rowJson + '\n]}}';
-  if (messages.length < {}) payload += ',"more":true';
-  return payload;
+  const payload = {{total: total, messages: messages}};
+  if (messages.length < {}) payload.more = true;
+  return JSON.stringify(payload);
 }})()"#,
         js_str(&cmd),
         limit,
@@ -195,11 +204,15 @@ fn chats_expr(limit: u32, offset: u32) -> String {
         "sqlite3 -separator '|||' {db} \"\
          SELECT COUNT(*) FROM chat; \
          SELECT COALESCE(NULLIF(c.chat_identifier,''),'unknown'),\
-         COALESCE(c.display_name,''),COALESCE(c.service_name,''),\
+         COALESCE(REPLACE(c.display_name,'|||','/'),''),COALESCE(c.service_name,''),\
          COALESCE((SELECT h.id FROM handle h JOIN chat_handle_join chj \
            ON chj.handle_id=h.ROWID WHERE chj.chat_id=c.ROWID LIMIT 1),''),\
          (SELECT COUNT(*) FROM chat_message_join cmj2 WHERE cmj2.chat_id=c.ROWID),\
-         datetime(COALESCE(MAX(cmj3.message_date),0)/1000000000+978307200,'unixepoch') \
+         datetime(COALESCE(MAX(cmj3.message_date),0)/1000000000+978307200,'unixepoch'),\
+         (SELECT COUNT(DISTINCT chj2.handle_id) FROM chat_handle_join chj2 \
+           WHERE chj2.chat_id=c.ROWID),\
+         COALESCE((SELECT GROUP_CONCAT(DISTINCT h3.id) FROM chat_handle_join chj3 \
+           JOIN handle h3 ON h3.ROWID=chj3.handle_id WHERE chj3.chat_id=c.ROWID),'') \
          FROM chat c \
          LEFT JOIN chat_message_join cmj3 ON cmj3.chat_id=c.ROWID \
          GROUP BY c.ROWID ORDER BY MAX(cmj3.message_date) DESC \
@@ -210,16 +223,25 @@ fn chats_expr(limit: u32, offset: u32) -> String {
   const app = Application.currentApplication();
   app.includeStandardAdditions = true;
   const out = String(app.doShellScript({}));
-  const lines = out.length === 0 ? [] : out.split('\n');
+  // doShellScript emits CR-delimited text — accept CR, CRLF and LF.
+  const lines = out.length === 0 ? [] : out.split(/\r\n|\r|\n/);
   const total = Number(lines[0]) || 0;
-  const chats = lines.slice(1).map(line => {{
-    const [identifier, display_name, service, handle, message_count, last_activity] = line.split('|||');
-    return {{identifier: identifier, display_name: display_name, service: service,
-            handle: handle, message_count: Number(message_count) || 0,
-            last_activity: last_activity}};
-  }});
-  const rowJson = chats.map(c => JSON.stringify(c)).join(',\n');
-  return '{{"total":' + total + ',"chats":[\n' + rowJson + '\n]}}';
+    // Stored display names carry the same control-char hazard as text.
+    const clean = s2 => String(s2 == null ? '' : s2)
+      .replace(/[\u0000-\u001F\u007F\u2028\u2029]/g, ' ');
+    const chats = lines.slice(1).map(line => {{
+      const [identifier, display_name, service, handle, message_count,
+             last_activity, participant_count, participants] = line.split('|||');
+      const pc = Number(participant_count) || 0;
+      return {{identifier: clean(identifier), display_name: clean(display_name),
+              service: clean(service), handle: clean(handle),
+              message_count: Number(message_count) || 0,
+              last_activity: clean(last_activity),
+              is_group: pc > 1,
+              participants: participants ? clean(participants).split(',').slice(0, 8) : [],
+              participant_count: pc}};
+    }});
+    return JSON.stringify({{total: total, chats: chats}});
 }})()"#,
         js_str(&cmd),
     )
@@ -240,4 +262,51 @@ fn send_expr(to: &str, body: &str) -> String {
         js_str(to),
         js_str(body),
     )
+}
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn chats_builder_counts_participants_for_group_detection() {
+        let script = chats_expr(20, 0);
+        assert!(
+            script.contains("COUNT(DISTINCT chj2.handle_id)"),
+            "{script}"
+        );
+        assert!(script.contains("GROUP_CONCAT(DISTINCT h3.id)"), "{script}");
+    }
+
+    #[test]
+    fn read_builder_strips_separator_collisions_from_text() {
+        let script = read_expr(Some("a@x"), 10, 0);
+        assert!(script.contains("'|||','/'"), "{script}");
+    }
+
+    #[test]
+    fn mappers_split_on_every_line_ending_style() {
+        // doShellScript returns CR-delimited output (classic JXA quirk):
+        // splitting on '\n' alone collapsed the whole blob into one line,
+        // yielding silent total:0 against EVERY live mailbox.
+        for script in [read_expr(Some("a@x"), 10, 0), chats_expr(20, 0)] {
+            assert!(
+                script.contains("split(/\\r\\n|\\r|\\n/)"),
+                "mapper must handle CR/CRLF/LF: {script}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod debug_probe {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn print_read_expr() {
+        let expr = read_expr(Some("+17038140603"), 2, 0);
+        std::fs::write("/tmp/full_expr.txt", &expr).unwrap();
+        eprintln!("WROTE /tmp/full_expr.txt ({} bytes)", expr.len());
+    }
 }

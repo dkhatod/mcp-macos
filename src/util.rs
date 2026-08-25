@@ -47,6 +47,20 @@ pub(crate) fn unwrap_string_payload(
     }
 }
 
+/// Strips control characters that corrupt downstream JSON consumers while
+/// preserving `\n` / `\t` (row-per-line compaction relies on both).
+pub(crate) fn sanitize_json_text(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c,
+            c if (c as u32) < 0x20 || (c as u32) == 0x7F || c == '\u{2028}' || c == '\u{2029}' => {
+                ' '
+            }
+            _ => c,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::js_str;

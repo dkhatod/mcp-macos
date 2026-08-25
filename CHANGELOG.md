@@ -8,6 +8,30 @@ versions are semver (0.x: breaking changes bump minor).
 ## [0.1.10] — 2026-08-24
 
 ### Fixed
+- **Messages: every live read returned silently empty (`total:0`).**
+  JXA's `doShellScript` returns stdout with CR line endings; both mappers
+  split on `\n` only, collapsing the entire sqlite output into one blob
+  (`Number(blob)||0 → total:0`, no rows) while still reporting success.
+  This was also the true root cause of the long-failing
+  `real_messages_read`: the original code concatenated that same blob into
+  invalid JSON ("trailing characters at line 3"). Mappers now accept
+  CR/CRLF/LF.
+- **Messages: `messages_read` corrupted its own envelope on hostile stored
+  text.** Real chat text can carry characters the SQL CR/LF strip misses
+  (U+2028/U+2029, vertical tab) or collide with the `|||` field separator;
+  the hand-built single-line JSON payload then failed to parse
+  ("trailing characters at line 3" — the long-failing
+  `real_messages_read` live test). Mappers now sanitize every field,
+  build payloads via `JSON.stringify`, and the Rust side strips residuals
+  as defense in depth. Live test green for the first time.
+- **Messages: group chats were indistinguishable from individuals.**
+  `messages_chats` now returns `is_group`, `participant_count`, and up to
+  8 `participants` per chat (SQL `COUNT(DISTINCT handle)` +
+  `GROUP_CONCAT`), so agents can resolve "the group with X" and never
+  mistake a multi-person thread for one person.
+- **Messages: `send` probed only the FIRST enabled service**, misrouting
+  handles that live under the other one; it now walks every enabled
+  service until the participant resolves and reports which service sent.
 - **`mail_sync` aborted entire sweeps on poison folders.** Live finding:
   the special `Google/Notes` and `Exchange/Notes` mailboxes throw
   AppleEvent -1728 on bulk message fetches; the sync driver propagated that

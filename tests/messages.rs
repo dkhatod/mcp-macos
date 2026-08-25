@@ -6,6 +6,7 @@ use common::balanced;
 use mcp_macos::messages::MessagesToolset;
 use personai_core::macos::MockTransport;
 use personai_core::safety::SoftGate;
+use serde_json::{Value, json};
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -114,9 +115,15 @@ async fn read_emits_single_invocation_with_total_header() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn real_messages_read() {
+    // Privacy-first: live reads only run when a chat is explicitly scoped
+    // via MCP_MESSAGES_LIVE_CHAT (see tests/messages_live_scoped.rs).
+    let Some(chat) = std::env::var("MCP_MESSAGES_LIVE_CHAT").ok() else {
+        eprintln!("skipped: set MCP_MESSAGES_LIVE_CHAT=<identifier> to opt in");
+        return;
+    };
     use personai_core::macos::JxaTransport;
     let mut ts = MessagesToolset::new(JxaTransport);
-    match ts.read(None, Some(3), 0).await {
+    match ts.read(Some(chat), Some(3), 0).await {
         Ok(res) => {
             let v: serde_json::Value = serde_json::from_str(&res).unwrap();
             assert!(v["messages"].as_array().is_some());
@@ -238,4 +245,71 @@ async fn debug_raw_recaptures_stdout_only_when_env_gated() {
     unsafe {
         std::env::remove_var("MCP_MACOS_DEBUG_RAW");
     }
+}
+
+// --- Hostile content: the envelope must survive ANY stored text ------------
+
+#[tokio::test]
+async fn read_tolerates_control_characters_in_text() {
+    // Live finding: real message text can carry characters SQL's
+    // REPLACE(char(13)/(10)) does not strip (vertical tab, U+2028…). The
+    // mapper builds single-line JSON, so one stray control char corrupted
+    // the whole envelope ("trailing characters at line 3").
+    // Payload travels as a PRESERIALIZED string (house contract); the
+    // hostile character rides INSIDE it, exactly like live sqlite output.
+    // U+2028/U+2029 pass serde_json parsing untouched (valid JSON!) yet break
+    // naive single-line consumers — exactly the live corruption class. Raw
+    // C0 controls (<0x20) cannot reach this layer: both parse stages reject
+    // them first, so they are not part of the reachable threat model here.
+    let hostile = "line\u{2028}sep\u{2029}end";
+    let payload = format!(
+        "{{\"total\":1,\"messages\":[\n{{\"from\":\"a@x\",\"direction\":\"in\",\"text\":\"{hostile}\",\"date\":\"2026-08-24T00:00:00Z\"}}\n]}}"
+    );
+    let canned = json!({ "ok": true, "value": payload }).to_string();
+    let mut f = fixture(&[canned.as_str()]);
+    let out = f.ts.read(Some("a@x".into()), Some(5), 0).await.unwrap();
+    // The returned payload must re-parse cleanly — no raw control chars.
+    let v: Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("envelope corrupted by stored text: {e}: {out}"));
+    assert_eq!(v["total"], 1);
+}
+
+#[tokio::test]
+async fn chats_tolerate_control_characters_in_display_names() {
+    let mut f = fixture(&[r#"{"ok":true,"value":{"total":1,"chats":[
+        {"identifier":"chat-1","display_name":"bad\u2028name","service":"iMessage","handle":"a@x","message_count":2,"last_activity":"2026-08-24"}
+    ]}}"#]);
+    let out = f.ts.chats(Some(5), 0).await.unwrap();
+    assert!(out.contains("bad"), "{out}");
+}
+
+// --- Group-chat resolution -------------------------------------------------
+
+#[tokio::test]
+async fn chats_surface_group_flag_and_participants() {
+    // Inner payload built programmatically — hand-escaping two JSON levels
+    // is how typos become "mystery" parse failures.
+    let payload = serde_json::json!({
+        "total": 2,
+        "chats": [
+            {"identifier":"chat-9","display_name":"Weekend Crew","service":"iMessage",
+             "handle":"a@x","message_count":42,"last_activity":"2026-08-24T01:00:00Z",
+             "participant_count":4,"participants":["a@x","b@x","c@x","d@x"],
+             "is_group": true},
+            {"identifier":"+15551234567","display_name":"","service":"iMessage",
+             "handle":"+15551234567","message_count":7,"last_activity":"2026-08-23T01:00:00Z",
+             "participant_count":1,"participants":["+15551234567"],
+             "is_group": false}
+        ]
+    });
+    let envelope = serde_json::json!({"ok": true, "value": payload.to_string()});
+    let canned = envelope.to_string();
+    let mut f = fixture(&[canned.as_str()]);
+    let out = f.ts.chats(Some(5), 0).await.unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let chats = v["chats"].as_array().unwrap();
+    assert_eq!(chats[0]["is_group"], true);
+    assert_eq!(chats[0]["participants"].as_array().unwrap().len(), 4);
+    assert_eq!(chats[0]["participant_count"], 4);
+    assert_eq!(chats[1]["is_group"], false, "1:1 chat by participant count");
 }
