@@ -50,20 +50,27 @@ CREATE TABLE IF NOT EXISTS mail_bodies(
 
 const SOURCE: &str = "mail";
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct FolderSyncStats {
     pub scanned: usize,
     pub new: usize,
     pub updated: usize,
     pub mismatches: usize,
+    /// Script-level failure for THIS folder (e.g. AppleEvent -1728 on the
+    /// special Notes mailboxes). The folder is skipped; the sweep lives on.
+    pub error: Option<String>,
 }
 
 impl FolderSyncStats {
-    fn to_json(self) -> Value {
-        json!({
+    fn to_json(&self) -> Value {
+        let mut v = json!({
             "scanned": self.scanned, "new": self.new,
             "updated": self.updated, "mismatches": self.mismatches,
-        })
+        });
+        if let Some(e) = &self.error {
+            v["error"] = json!(e);
+        }
+        v
     }
 }
 
@@ -105,11 +112,19 @@ pub fn sync_expr(account: &str, mailbox: &str, since_iso: Option<&str>, scan: u3
     if (!boxes.length) return {{rows: [], scanned: 0}};
     box = boxes[0];
   }} catch (e) {{ return {{rows: [], scanned: 0}}; }}
-  const scan = Math.min(box.messages.length, {scan});
-  const ids = box.messages.id().slice(0, scan);
-  const subjects = box.messages.subject().slice(0, scan);
-  const senders = box.messages.sender().slice(0, scan);
-  const dates = box.messages.dateReceived().slice(0, scan);
+  let scan, ids, subjects, senders, dates;
+  try {{
+    // Special mailboxes (Google/Notes, Exchange/Notes) throw -1728 on bulk
+    // message fetches — report them instead of killing the script.
+    if (!box.messages.length) return {{rows: [], scanned: 0}};
+    scan = Math.min(box.messages.length, {scan});
+    ids = box.messages.id().slice(0, scan);
+    subjects = box.messages.subject().slice(0, scan);
+    senders = box.messages.sender().slice(0, scan);
+    dates = box.messages.dateReceived().slice(0, scan);
+  }} catch (fetchErr) {{
+    return {{rows: [], scanned: 0, error: String(fetchErr.message || fetchErr)}};
+  }}
   const rows = [];
   for (let i = 0; i < ids.length; i++) {{
     if (SINCE_MS !== null && dates[i] && dates[i].getTime() < SINCE_MS) continue;
@@ -220,7 +235,18 @@ pub async fn sync_folder<T: AppleTransport>(
         stored_wm.as_ref().map(|(wm, _, _)| wm.clone())
     };
 
-    let (rows, scanned) = fetch_rows(t, account, mailbox, delta_since.as_deref(), scan).await?;
+    let (rows, scanned) = match fetch_rows(t, account, mailbox, delta_since.as_deref(), scan).await
+    {
+        Ok(rs) => rs,
+        // Poison/special folder (AppleEvent errors, parse failures): record
+        // and move on. Only index-write problems below may still fail hard.
+        Err(e) => {
+            return Ok(FolderSyncStats {
+                error: Some(e.to_string()),
+                ..Default::default()
+            });
+        }
+    };
 
     let mut stats = FolderSyncStats {
         scanned,
@@ -336,10 +362,23 @@ pub async fn sync_targets<T: AppleTransport>(
     };
     let t0 = std::time::Instant::now();
     let mut per_folder = serde_json::Map::new();
+    let mut errors = serde_json::Map::new();
     for (account, mailbox) in pairs {
         let key = format!("{account}/{mailbox}");
-        let stats = sync_folder(t, h, &account, &mailbox, full, scan).await?;
-        per_folder.insert(key, stats.to_json());
+        match sync_folder(t, h, &account, &mailbox, full, scan).await {
+            Ok(stats) if stats.error.is_none() => {
+                per_folder.insert(key, stats.to_json());
+            }
+            Ok(stats) => {
+                errors.insert(key.clone(), json!(stats.error.clone().unwrap_or_default()));
+                per_folder.insert(key, stats.to_json());
+            }
+            // Index-level failure (systemic — broken db): record but keep
+            // the rest of the sweep alive.
+            Err(e) => {
+                errors.insert(key.clone(), json!(e.to_string()));
+            }
+        }
     }
     // data_as_of = max watermark across swept scopes.
     let mut data_as_of = String::new();
@@ -350,12 +389,15 @@ pub async fn sync_targets<T: AppleTransport>(
             data_as_of = wm;
         }
     }
-    Ok(json!({
+    let mut out = json!({
         "synced_per_folder": Value::Object(per_folder),
         "data_as_of": data_as_of,
         "duration_ms": t0.elapsed().as_millis() as u64,
-    })
-    .to_string())
+    });
+    if !errors.is_empty() {
+        out["errors"] = Value::Object(errors);
+    }
+    Ok(out.to_string())
 }
 
 /// Query parameters for index-mode search (mirrors `mail_search` semantics).

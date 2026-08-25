@@ -5,6 +5,19 @@ versions are semver (0.x: breaking changes bump minor).
 
 ## [Unreleased]
 
+## [0.1.10] — 2026-08-24
+
+### Fixed
+- **`mail_sync` aborted entire sweeps on poison folders.** Live finding:
+  the special `Google/Notes` and `Exchange/Notes` mailboxes throw
+  AppleEvent -1728 on bulk message fetches; the sync driver propagated that
+  as a fatal error, so a 29-folder sweep died at the first Notes mailbox
+  and index mode looked "broken" (-1728). Folder-level script errors are
+  now isolated: JS guards the fetch section, per-folder stats carry an
+  optional `error`, `sync_targets` records them under a top-level `errors`
+  map and keeps sweeping. Only systemic failures remain observable as
+  such — every other folder still syncs.
+
 ## [0.1.9] — 2026-08-24
 
 ### Fixed

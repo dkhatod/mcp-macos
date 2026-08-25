@@ -5,7 +5,7 @@ use mcp_macos::mail::MailTargets;
 use mcp_macos::mail_index::{fingerprint, sync_expr, sync_folder, sync_targets};
 use personai_core::index::IndexHandle;
 use personai_core::macos::MockTransport;
-use serde_json::json;
+use serde_json::{Value, json};
 
 fn handle(name: &str) -> IndexHandle {
     let dir = tempfile::tempdir().unwrap();
@@ -153,6 +153,47 @@ async fn sync_targets_rejects_unified_with_hint() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(msg.to_lowercase().contains("folder"), "{msg}");
+}
+
+#[tokio::test]
+async fn sync_sweep_survives_a_folder_that_throws() {
+    // Live finding: Google/Notes and Exchange/Notes throw AppleEvent -1728
+    // on bulk message fetches. One poison folder must never discard the
+    // other ~27 folders' work.
+    let h = handle("poison.db");
+    let mut t = MockTransport::new();
+    t.enqueue(&envelope(json!([
+        { "i": "1", "s": "x", "f": "a@x", "d": "2026-08-01T00:00:00.000Z" }
+    ])));
+    // Poison folder: JXA error envelope (-1728).
+    t.enqueue(
+        &json!({
+            "ok": false,
+            "error": {"number": -1728, "desc": "Can't get object."}
+        })
+        .to_string(),
+    );
+    t.enqueue(&envelope(json!([
+        { "i": "2", "s": "y", "f": "b@x", "d": "2026-08-02T00:00:00.000Z" }
+    ])));
+    let targets = MailTargets::Folders(vec![
+        ("Exchange".into(), "Apps".into()),
+        ("Exchange".into(), "Notes".into()),
+        ("Google".into(), "INBOX".into()),
+    ]);
+    let out = sync_targets(&mut t, &h, &targets, false, 5000)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["synced_per_folder"]["Exchange/Apps"]["scanned"], 1);
+    assert_eq!(v["synced_per_folder"]["Google/INBOX"]["scanned"], 1);
+    assert!(
+        v["errors"]["Exchange/Notes"]
+            .as_str()
+            .unwrap()
+            .contains("-1728"),
+        "poison folder recorded, sweep continued: {out}"
+    );
 }
 
 #[tokio::test]
